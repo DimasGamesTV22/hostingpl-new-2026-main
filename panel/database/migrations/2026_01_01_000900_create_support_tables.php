@@ -24,7 +24,10 @@ return new class extends Migration
             $table->uuid();
             $table->foreignId('user_id')->constrained()->cascadeOnDelete();
             $table->foreignId('server_id')->nullable()->constrained()->nullOnDelete();
-            $table->foreignId('department_id')->nullable()->constrained()->nullOnDelete();
+            // Таблица называется ticket_departments. Без явного имени
+            // constrained() вывел бы из колонки «departments» — таблицы,
+            // которой в схеме нет, и внешний ключ не создался бы.
+            $table->foreignId('department_id')->nullable()->constrained('ticket_departments')->nullOnDelete();
             $table->foreignId('assigned_to')->nullable()->constrained('users')->nullOnDelete();
             $table->string('subject', 190);
             $table->string('category', 64)->nullable();

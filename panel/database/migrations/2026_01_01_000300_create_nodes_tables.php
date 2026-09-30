@@ -98,13 +98,17 @@ return new class extends Migration
         Schema::create('resource_allocations', function (Blueprint $table) {
             $table->id();
             $table->foreignId('node_id')->constrained()->cascadeOnDelete();
-            $table->foreignId('server_id')->nullable()->constrained()->cascadeOnDelete();
+            // Ключ на servers добавляется в 000550 — таблица servers создаётся
+            // в 000500, позже этой миграции.
+            $table->foreignId('server_id')->nullable();
             $table->string('kind', 16); // game | query | rcon
             $table->unsignedInteger('port');
             $table->boolean('is_primary')->default(false);
             $table->boolean('is_reserved')->default(false);
             $table->string('label', 64)->nullable();
-            $table->unsignedDecimal('price', 10, 2)->nullable();
+            // unsignedDecimal() в Laravel 11 не существует: есть decimal(),
+            // а беззнаковость задаётся модификатором ->unsigned().
+            $table->decimal('price', 10, 2)->unsigned()->nullable();
             $table->timestamps();
 
             $table->unique(['node_id', 'port']);

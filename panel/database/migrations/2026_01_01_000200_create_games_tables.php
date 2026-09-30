@@ -134,7 +134,12 @@ return new class extends Migration
         Schema::create('game_template_installs', function (Blueprint $table) {
             $table->id();
             $table->foreignId('game_template_id')->constrained()->cascadeOnDelete();
-            $table->foreignId('server_id')->constrained()->cascadeOnDelete();
+            // Внешний ключ на servers добавляется в 000550: таблица servers
+            // создаётся в 000500, то есть позже этой миграции. MySQL отвечает
+            // на попытку создать ключ на ещё не существующую таблицу ошибкой
+            // 150 «Foreign key constraint is incorrectly formed» и роняет всю
+            // миграцию.
+            $table->foreignId('server_id');
             $table->foreignId('user_id')->nullable()->constrained()->nullOnDelete();
             $table->string('status', 20)->default('queued'); // queued | downloading | installed | failed | removed
             $table->unsignedTinyInteger('progress')->default(0);

@@ -89,7 +89,9 @@ return new class extends Migration
 
             $table->index(['user_id', 'status']);
             $table->index(['node_id', 'status']);
-            $table->index('expires_at');
+            // Индекс на expires_at уже задан в объявлении колонки
+            // (->nullable()->index()), повторный вызов даёт
+            // «Duplicate key name 'servers_expires_at_index'» и роняет миграцию.
             $table->index('address');
         });
 
