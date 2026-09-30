@@ -1,0 +1,23 @@
+{
+  "name": "gamedock-agent",
+  "version": "1.0.0",
+  "description": "GameDock node agent: manages game server processes, files, backups and metrics over WebSocket",
+  "type": "module",
+  "main": "src/index.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "gamedock-agent": "./bin/gamedock-agent.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test tests/",
+    "lint": "node --check src/index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

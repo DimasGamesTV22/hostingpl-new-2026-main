@@ -1,0 +1,19 @@
+{
+    "name": "gamedock-bot",
+    "version": "1.0.0",
+    "description": "GameDock Telegram bot: уведомления, управление серверами, приём оплаты через @CryptoBot",
+    "type": "module",
+    "main": "src/index.js",
+    "license": "MIT",
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "scripts": {
+        "start": "node src/index.js",
+        "dev": "node --watch src/index.js",
+        "test": "node --test tests/",
+        "check": "node --check src/index.js"
+    },
+    "dependencies": {},
+    "devDependencies": {}
+}

@@ -1,0 +1,46 @@
+<?php
+
+return [
+    'title' => 'Security',
+    'two_factor' => 'Two-factor authentication',
+    'two_factor_hint' => 'Sign-in will require a code from an authenticator app (Google Authenticator, Aegis, Bitwarden).',
+    'two_factor_required' => '2FA is mandatory for your role',
+    'two_factor_grace' => 'Enable 2FA within :days days, otherwise admin access will be limited',
+    'secret' => 'Secret key',
+    'manual_entry' => 'Enter manually if the QR code is not scanned',
+    'scan_qr' => 'Scan the QR code',
+    'confirm_code' => 'Enter the code from the app to confirm',
+    'enable' => 'Enable',
+    'disable' => 'Disable',
+    'enabled_at' => 'Enabled',
+    'recovery_codes' => 'Recovery codes',
+    'recovery_codes_hint' => 'Each code can be used once. Store them somewhere safe.',
+    'regenerate' => 'Generate new codes',
+    'sessions' => 'Active sessions',
+    'sessions_hint' => 'If you do not recognise a device — revoke that session.',
+    'current_device' => 'Current device',
+    'revoke' => 'Revoke',
+    'revoke_all' => 'Revoke all other sessions',
+    'login_history' => 'Sign-in history',
+    'failed_attempts' => 'Failed attempts',
+    'change_password' => 'Change password',
+    'session_revoked' => 'Session revoked',
+    'sessions_revoked' => 'Revoked sessions: :count',
+    'last_activity' => 'Last activity',
+    'device' => 'Device',
+    'ip' => 'IP',
+
+    'messages' => [
+        '2fa_secret_generated' => 'Secret generated. Scan the QR code and confirm with a code.',
+        '2fa_enabled' => 'Two-factor authentication enabled',
+        '2fa_disabled' => 'Two-factor authentication disabled',
+        'recovery_regenerated' => 'New recovery codes generated',
+        'session_revoked' => 'Session revoked',
+        'sessions_revoked' => 'Revoked sessions: :count',
+    ],
+
+    'errors' => [
+        'invalid_code' => 'Invalid confirmation code',
+        'wrong_password' => 'Wrong password',
+    ],
+];

@@ -1,0 +1,69 @@
+# ── Секреты и локальное окружение ────────────────────────────────────────
+# Сначала игнорируем всё, что похоже на конфиг с секретами...
+.env
+.env.*
+*.env
+
+# ...потом возвращаем шаблоны. Порядок важен: правила ниже перекрывают верхние.
+# Сейчас в репозитории: .env.docker.example, panel/.env.example,
+# panel/.env.testing, bot/.env.example. У агента конфиг не через .env,
+# а через agent.config.json.
+!*.env.example
+!/.env.docker.example
+!/panel/.env.testing
+
+config/hosting.local.php
+
+# ── Тесты ────────────────────────────────────────────────────────────────
+.phpunit.cache/
+/panel/.phpunit.cache/
+/panel/.phpunit.result.cache
+
+# ── Зависимости ──────────────────────────────────────────────────────────
+/panel/vendor/
+/panel/node_modules/
+/agent/node_modules/
+/bot/node_modules/
+/panel/storage/*.key
+
+# ── Собранный фронтенд ───────────────────────────────────────────────────
+/panel/public/build/
+/panel/public/hot
+/panel/public/storage
+/panel/storage/framework/cache/data/*
+/panel/storage/framework/sessions/*
+/panel/storage/framework/views/*
+/panel/storage/logs/*
+!/panel/storage/framework/cache/data/.gitignore
+!/panel/storage/framework/sessions/.gitignore
+!/panel/storage/framework/views/.gitignore
+!/panel/storage/logs/.gitignore
+
+# ── Агент ────────────────────────────────────────────────────────────────
+# agent.config.json — это ШАБЛОН (token = REPLACE_ME), его коммитим.
+# Реальные конфиги ноды лежат в /etc/gamedock/agent.json и сюда не попадают,
+# но на всякий случай игнорируем варианты с секретами.
+/agent/agent.local.json
+/agent/certs/
+*.log
+logs/
+
+# ── Бот ──────────────────────────────────────────────────────────────────
+/bot/.env
+/bot/data/
+
+# ── Бэкапы и временное ───────────────────────────────────────────────────
+backups/
+*.tar.gz
+*.sql
+*.sqlite
+*.sqlite3
+tmp/
+.cache/
+
+# ── Редакторы и ОС ───────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

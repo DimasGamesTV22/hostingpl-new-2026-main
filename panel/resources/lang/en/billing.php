@@ -1,0 +1,107 @@
+<?php
+
+return [
+    'title' => 'Billing & wallet',
+    'balance' => 'Balance',
+    'top_up' => 'Top up',
+    'withdraw' => 'Withdraw funds',
+    'amount' => 'Amount',
+    'method' => 'Payment method',
+    'transactions' => 'Transactions',
+    'deposits' => 'Deposits',
+    'orders' => 'Orders',
+    'services' => 'Services',
+    'pending_charges' => 'Pending charges',
+    'pay_all' => 'Pay all',
+    'charge' => 'Charge',
+    'next_charge' => 'Next charge',
+    'summary' => 'Summary',
+    'income' => 'Income',
+    'expense' => 'Expenses',
+    'net' => 'Net',
+    'total_deposited' => 'Total deposited',
+    'total_spent' => 'Total spent',
+    'grace_period' => 'After the rental period ends the server keeps running for :days more days.',
+    'auto_stop' => 'Servers are stopped automatically when the balance reaches zero',
+    'expiring_soon' => 'Expiring soon',
+    'no_charges' => 'No pending charges',
+    'export' => 'Export to CSV',
+    'filter_period' => 'Period',
+    'auto_topup' => 'Auto top-up',
+    'auto_topup_hint' => 'Top up automatically when the balance drops below :threshold',
+    'promo_code' => 'Promo code',
+    'apply_promo' => 'Apply',
+    'payment_pending' => 'Waiting for the payment to be confirmed',
+    'payment_succeeded' => 'Payment received',
+    'payment_cancelled' => 'Payment cancelled',
+    'crypto' => 'Currency',
+    'card' => 'Bank card',
+    'sbp' => 'SBP',
+
+    'types' => [
+        'deposit' => 'Deposit',
+        'withdraw' => 'Withdrawal',
+        'purchase' => 'Purchase',
+        'refund' => 'Refund',
+        'bonus' => 'Bonus',
+        'referral' => 'Referral reward',
+        'adjustment' => 'Adjustment',
+        'charge' => 'Server payment',
+    ],
+
+    'titles' => [
+        'deposit' => 'Deposit via :method',
+        'charge' => 'Server payment :server',
+        'purchase' => 'Purchase :label',
+    ],
+
+    'messages' => [
+        'deposit_created' => 'Invoice created. Please pay it using the link.',
+        'deposit_paid' => 'Funds have been credited to your balance',
+        'deposit_pending' => 'The payment has not been confirmed yet',
+        'withdraw_requested' => 'Withdrawal request created, we will reply in a ticket',
+        'paid' => 'Paid',
+    ],
+
+    'notices' => [
+        'charged' => 'Charged :amount for server :server',
+        'charged_until' => 'Paid until :date',
+    ],
+
+    'suspend' => [
+        'reason_expired' => 'The rental period expired on :date',
+    ],
+
+    'withdraw' => [
+        'subject' => 'Withdrawal request :amount',
+    ],
+
+    'errors' => [
+        'payments_disabled' => 'Payments are currently disabled',
+        'min_deposit' => 'Minimum deposit is :min',
+        'method_unavailable' => 'This payment method is unavailable',
+        'deposit_failed' => 'Could not create the invoice',
+        'insufficient_funds' => 'Insufficient balance',
+        'insufficient_funds_short' => 'Insufficient funds: :amount required',
+        'no_funds' => 'Your balance is empty — top it up first',
+    ],
+
+    'deposit' => [
+        'title' => 'Top up balance',
+        'choose_method' => 'Choose a payment method',
+        'amount' => 'Deposit amount',
+        'quick_amounts' => 'Quick amounts',
+        'pay' => 'Proceed to payment',
+        'manual_hint' => 'After paying, send the receipt to support — we will credit it manually.',
+        'details' => 'Payment details',
+        'status' => 'Payment status',
+        'created' => 'Invoice created',
+        'expires' => 'Valid until',
+        'paid_at' => 'Paid',
+        'check' => 'Check status',
+        'open_link' => 'Open the payment link',
+        'waiting' => 'Waiting for the payment provider to confirm. This usually takes under a minute.',
+        'closed' => 'Payments are temporarily unavailable',
+        'closed_hint' => 'Please try again later or contact support.',
+    ],
+];

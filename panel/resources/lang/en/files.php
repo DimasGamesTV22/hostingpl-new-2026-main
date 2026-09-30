@@ -1,0 +1,48 @@
+<?php
+
+return [
+    'title' => 'Files',
+    'root' => 'Root',
+    'name' => 'Name',
+    'size' => 'Size',
+    'modified' => 'Modified',
+    'permissions' => 'Permissions',
+    'edit' => 'Editor',
+    'save_file' => 'Save file',
+    'new_folder' => 'New folder',
+    'rename' => 'Rename',
+    'delete_file' => 'Delete',
+    'delete_confirm' => 'Delete :name? This cannot be undone.',
+    'upload_file' => 'Upload file',
+    'download_file' => 'Download',
+    'search_files' => 'Search files',
+    'search_placeholder' => 'File or folder name',
+    'no_files' => 'This folder is empty',
+    'binary_file' => 'This is a binary file and cannot be opened in the editor',
+    'read_only_hint' => 'You do not have permission to modify files of this server.',
+    'file_too_big' => 'The file is too large for the built-in editor',
+    'unsaved' => 'There are unsaved changes',
+    'usage' => 'Used :used of :total',
+    'editor' => 'Editor',
+    'select_file' => 'Select a file to edit',
+    'no_results' => 'Nothing found',
+    'found' => 'Found: :count',
+
+    'messages' => [
+        'saved' => 'File saved',
+        'created' => 'Folder created',
+        'renamed' => 'Renamed',
+        'deleted' => 'Deleted',
+        'uploaded' => 'File uploaded',
+    ],
+
+    'errors' => [
+        'bad_path' => 'Invalid path',
+        'protected' => 'This file is protected from editing',
+        'protected_dir' => 'Folder :name cannot be deleted',
+        'too_big' => 'Maximum size is :max',
+        'read_failed' => 'Could not read the file',
+        'write_failed' => 'Could not write the file',
+        'not_found' => 'File not found',
+    ],
+];

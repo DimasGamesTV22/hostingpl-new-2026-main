@@ -1,0 +1,96 @@
+{
+    "$schema": "./agent.config.schema.json",
+    "comment": [
+        "Пример конфигурации агента GameDock — сразу после распаковки репозитория.",
+        "Скопируйте в /etc/gamedock/agent.json (или оставьте здесь) и подставьте",
+        "значения из панели: Админка → Ноды → Показать токен.",
+        "Пароль из поля 'token' показывается один раз — сохраните его здесь.",
+        "",
+        "Ключи ниже соответствуют значениям по умолчанию в agent/src/config.js.",
+        "Что не указано — берётся оттуда же, так что этот файл можно",
+        "сократить до panel / token / nodeId."
+    ],
+
+    "panel": "https://panel.example.com",
+    "wsPath": "/agent/ws",
+    "nodeId": 1,
+    "token": "gd-node-REPLACE_ME",
+
+    "reconnect": true,
+    "reconnectDelay": 5000,
+    "reconnectDelayMax": 60000,
+    "heartbeatInterval": 5,
+    "requestTimeout": 15000,
+
+    "serversRoot": "/home/gamedock/servers",
+    "backupsRoot": "/home/gamedock/backups",
+    "templatesRoot": "/opt/gamedock/game-images",
+    "pluginsRoot": "/home/gamedock/plugins",
+    "logsRoot": "/home/gamedock/logs",
+
+    "systemUser": "gamedock",
+    "systemGroup": "gamedock",
+
+    "runtime": "docker",
+
+    "docker": {
+        "socket": "/var/run/docker.sock",
+        "networkPrefix": "gamedock",
+        "defaultImage": "debian:12-slim",
+        "cgroupVersion": 2
+    },
+
+    "podman": {
+        "socket": "unix:///run/podman/podman.sock",
+        "networkPrefix": "gamedock",
+        "defaultImage": "debian:12-slim",
+        "rootless": false
+    },
+
+    "lxc": {
+        "pveHost": "10.0.0.1",
+        "pveUser": "root@pam",
+        "template": "local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst",
+        "storage": "local-lvm",
+        "bridge": "vmbr0"
+    },
+
+    "native": {
+        "cgroupRoot": "/sys/fs/cgroup/gamedock",
+        "systemdScope": "gamedock.slice"
+    },
+
+    "limits": {
+        "maxFileRead": 5242880,
+        "maxFileWrite": 2097152,
+        "maxUpload": 67108864,
+        "consoleBuffer": 2000,
+        "logTail": 5000
+    },
+
+    "backups": {
+        "compress": "tar.gz",
+        "exclude": ["cache", "logs", "*.tmp", "crashreports", "*.log"],
+        "s3": {
+            "enabled": false,
+            "endpoint": "",
+            "region": "ru-central-1",
+            "bucket": "",
+            "accessKey": "",
+            "secretKey": "",
+            "prefix": "backups"
+        }
+    },
+
+    "secretCodes": {
+        "prefixes": ["//", "!", "/promo"],
+        "chatAwareGames": ["samp", "mta", "ragemp", "altv", "crmp", "rust"]
+    },
+
+    "log": {
+        "level": "info",
+        "file": "/var/log/gamedock-agent.log",
+        "maxSize": "10M",
+        "maxFiles": 3
+    }
+}

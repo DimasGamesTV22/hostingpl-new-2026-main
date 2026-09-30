@@ -1,0 +1,161 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://gamedock.dev/schema/agent.config.schema.json",
+    "title": "GameDock — конфигурация агента ноды",
+    "description": "Схема файла agent.config.json. Неизвестные ключи допускаются: конфиг сливается с значениями по умолчанию из agent/src/config.js (deepMerge), поэтому достаточно задать panel, token и nodeId.",
+    "type": "object",
+    "required": ["panel", "token"],
+    "properties": {
+        "$schema": { "type": "string" },
+        "comment": {
+            "description": "Комментарий для человека — кодом не читается.",
+            "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }]
+        },
+
+        "panel": {
+            "type": "string",
+            "description": "Базовый URL панели, например https://panel.example.com",
+            "pattern": "^https?://.+"
+        },
+        "wsPath": { "type": "string", "default": "/agent/ws" },
+        "nodeId": { "type": ["integer", "null"], "minimum": 1 },
+        "token": {
+            "type": "string",
+            "description": "Токен ноды из админки. Показывается один раз.",
+            "minLength": 8
+        },
+
+        "reconnect": { "type": "boolean", "default": true },
+        "reconnectDelay": { "type": "integer", "minimum": 100, "description": "Мс до первой попытки переподключения" },
+        "reconnectDelayMax": { "type": "integer", "minimum": 100 },
+        "heartbeatInterval": { "type": "integer", "minimum": 1, "description": "Сек между heartbeat и батчами метрик" },
+        "requestTimeout": { "type": "integer", "minimum": 1000 },
+
+        "serversRoot": { "type": "string" },
+        "backupsRoot": { "type": "string" },
+        "templatesRoot": { "type": "string" },
+        "pluginsRoot": { "type": "string" },
+        "logsRoot": { "type": "string" },
+
+        "systemUser": { "type": "string" },
+        "systemGroup": { "type": "string" },
+
+        "runtime": {
+            "type": "string",
+            "enum": ["docker", "podman", "lxc", "native"],
+            "default": "docker",
+            "description": "Драйвер запуска игровых серверов на этой ноде"
+        },
+
+        "docker": {
+            "type": "object",
+            "properties": {
+                "socket": { "type": "string", "default": "/var/run/docker.sock" },
+                "networkPrefix": { "type": "string", "default": "gamedock" },
+                "defaultImage": { "type": "string", "default": "debian:12-slim" },
+                "cgroupVersion": { "type": "integer", "enum": [1, 2] }
+            }
+        },
+
+        "podman": {
+            "type": "object",
+            "properties": {
+                "socket": { "type": "string", "default": "unix:///run/podman/podman.sock" },
+                "networkPrefix": { "type": "string" },
+                "defaultImage": { "type": "string" },
+                "rootless": { "type": "boolean" }
+            }
+        },
+
+        "lxc": {
+            "type": "object",
+            "properties": {
+                "pveHost": { "type": "string", "description": "Адрес Proxmox VE" },
+                "pveUser": { "type": "string" },
+                "template": { "type": "string", "description": "Шаблон LXC, например local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst" },
+                "storage": { "type": "string" },
+                "bridge": { "type": "string" }
+            }
+        },
+
+        "native": {
+            "type": "object",
+            "properties": {
+                "cgroupRoot": { "type": "string" },
+                "systemdScope": { "type": "string" }
+            }
+        },
+
+        "limits": {
+            "type": "object",
+            "description": "Потолки для операций с файлами и консолью",
+            "properties": {
+                "maxFileRead": { "type": "integer", "minimum": 1024 },
+                "maxFileWrite": { "type": "integer", "minimum": 1024 },
+                "maxUpload": { "type": "integer", "minimum": 1024 },
+                "consoleBuffer": { "type": "integer", "minimum": 10 },
+                "logTail": { "type": "integer", "minimum": 10 }
+            }
+        },
+
+        "backups": {
+            "type": "object",
+            "properties": {
+                "compress": {
+                    "type": "string",
+                    "enum": ["tar.gz", "tar", "zip", "none"],
+                    "default": "tar.gz"
+                },
+                "exclude": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Шаблоны, не попадающие в архив"
+                },
+                "s3": {
+                    "type": "object",
+                    "description": "Выгрузка бэкапов в S3-совместимое хранилище",
+                    "properties": {
+                        "enabled": { "type": "boolean", "default": false },
+                        "endpoint": { "type": "string" },
+                        "region": { "type": "string" },
+                        "bucket": { "type": "string" },
+                        "accessKey": { "type": "string" },
+                        "secretKey": { "type": "string" },
+                        "prefix": { "type": "string" }
+                    }
+                }
+            }
+        },
+
+        "secretCodes": {
+            "type": "object",
+            "description": "Перехват секретных кодов в чате игроков",
+            "properties": {
+                "prefixes": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": ["//", "!", "/promo"]
+                },
+                "chatAwareGames": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": ["samp", "mta", "ragemp", "altv", "crmp", "rust"]
+                }
+            }
+        },
+
+        "log": {
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "string",
+                    "enum": ["error", "warn", "info", "debug", "trace"],
+                    "default": "info"
+                },
+                "file": { "type": "string" },
+                "maxSize": { "type": "string", "pattern": "^[0-9]+[KMG]?$" },
+                "maxFiles": { "type": "integer", "minimum": 1 }
+            }
+        }
+    }
+}

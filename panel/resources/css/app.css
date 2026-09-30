@@ -1,0 +1,201 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Базовая тема ───────────────────────────────────────────────────────── */
+@layer base {
+    :root {
+        --gd-primary: 99 102 241;
+        --gd-secondary: 14 165 233;
+        --gd-success: 34 197 94;
+        --gd-warning: 245 158 11;
+        --gd-danger: 239 68 68;
+    }
+
+    html {
+        @apply antialiased scroll-smooth;
+    }
+
+    body {
+        @apply bg-ink-950 text-ink-100 font-sans;
+    }
+
+    /* Скроллбар */
+    ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+    }
+    ::-webkit-scrollbar-track {
+        @apply bg-ink-900;
+    }
+    ::-webkit-scrollbar-thumb {
+        @apply bg-ink-700 rounded-full;
+        border: 2px solid theme('colors.ink.900');
+    }
+    ::-webkit-scrollbar-thumb:hover {
+        @apply bg-ink-600;
+    }
+
+    [x-cloak] {
+        display: none !important;
+    }
+}
+
+/* ── Компоненты ─────────────────────────────────────────────────────────── */
+@layer components {
+    .card {
+        @apply bg-ink-850 border border-ink-700/60 rounded-xl shadow-card;
+    }
+
+    .card-header {
+        @apply px-5 py-4 border-b border-ink-700/60 flex items-center justify-between gap-3;
+    }
+
+    .card-body {
+        @apply p-5;
+    }
+
+    .card-title {
+        @apply text-base font-semibold text-ink-100 flex items-center gap-2;
+    }
+
+    .btn {
+        @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium
+               transition-colors duration-150 focus:outline-none focus-visible:ring-2
+               focus-visible:ring-brand-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-ink-950
+               disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap;
+    }
+
+    .btn-primary {
+        @apply btn bg-brand-600 text-white hover:bg-brand-500 active:bg-brand-700;
+    }
+
+    .btn-secondary {
+        @apply btn bg-ink-700 text-ink-100 hover:bg-ink-600 border border-ink-600;
+    }
+
+    .btn-ghost {
+        @apply btn text-ink-300 hover:text-ink-100 hover:bg-ink-800;
+    }
+
+    .btn-danger {
+        @apply btn bg-red-600/90 text-white hover:bg-red-500;
+    }
+
+    .btn-success {
+        @apply btn bg-emerald-600/90 text-white hover:bg-emerald-500;
+    }
+
+    .btn-sm {
+        @apply px-2.5 py-1.5 text-xs rounded-md;
+    }
+
+    .input {
+        @apply block w-full rounded-lg border-ink-600 bg-ink-800 text-ink-100 text-sm
+               placeholder:text-ink-500 px-3 py-2 shadow-sm
+               focus:border-brand-500 focus:ring-1 focus:ring-brand-500/50 focus:outline-none
+               transition-colors read-only:bg-ink-850 read-only:text-ink-400;
+    }
+
+    .label {
+        @apply block text-sm font-medium text-ink-200 mb-1.5;
+    }
+
+    .hint {
+        @apply text-xs text-ink-400 mt-1.5;
+    }
+
+    .error {
+        @apply text-xs text-red-400 mt-1.5;
+    }
+
+    .select {
+        @apply input pr-9 appearance-none bg-no-repeat;
+        background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='%236b7488'%3e%3cpath fill-rule='evenodd' d='M5.23 7.21a.75.75 0 011.06.02L10 11.19l3.71-3.96a.75.75 0 111.08 1.04l-4.25 4.53a.75.75 0 01-1.08 0L5.21 8.27a.75.75 0 01.02-1.06z' clip-rule='evenodd'/%3e%3c/svg%3e");
+        background-position: right 0.6rem center;
+        background-size: 1.15em 1.15em;
+    }
+
+    .checkbox {
+        @apply rounded border-ink-500 bg-ink-800 text-brand-600 focus:ring-brand-500/50 focus:ring-1
+               focus:ring-offset-0;
+    }
+
+    .badge {
+        @apply inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium;
+    }
+
+    .badge-gray   { @apply badge bg-ink-700 text-ink-200; }
+    .badge-green  { @apply badge bg-emerald-500/15 text-emerald-300 border border-emerald-500/25; }
+    .badge-yellow { @apply badge bg-amber-500/15 text-amber-300 border border-amber-500/25; }
+    .badge-red    { @apply badge bg-red-500/15 text-red-300 border border-red-500/25; }
+    .badge-blue   { @apply badge bg-sky-500/15 text-sky-300 border border-sky-500/25; }
+    .badge-indigo { @apply badge bg-brand-500/15 text-brand-300 border border-brand-500/25; }
+
+    .table {
+        @apply w-full text-sm text-left;
+    }
+    .table thead th {
+        @apply px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-ink-400
+               border-b border-ink-700/60 bg-ink-850/60 whitespace-nowrap;
+    }
+    .table tbody td {
+        @apply px-4 py-3 border-b border-ink-800 align-middle;
+    }
+    .table tbody tr:hover {
+        @apply bg-ink-800/40;
+    }
+
+    .stat {
+        @apply card p-4;
+    }
+    .stat-label {
+        @apply text-xs font-medium uppercase tracking-wider text-ink-400;
+    }
+    .stat-value {
+        @apply mt-1 text-2xl font-semibold text-ink-100 tabular-nums;
+    }
+
+    .link {
+        @apply text-brand-400 hover:text-brand-300 underline-offset-2 hover:underline;
+    }
+
+    .divider {
+        @apply border-t border-ink-700/60;
+    }
+
+    /* Терминальная консоль */
+    .console {
+        @apply bg-black text-emerald-300 font-mono text-[12px] leading-[1.45] p-4 rounded-lg
+               overflow-auto whitespace-pre-wrap break-words select-text;
+        height: 420px;
+        scrollbar-width: thin;
+    }
+    .console-line-error   { @apply text-red-400; }
+    .console-line-warn    { @apply text-amber-300; }
+    .console-line-command { @apply text-sky-300; }
+    .console-line-system  { @apply text-ink-400 italic; }
+
+    /* Публичный статус */
+    .status-dot {
+        @apply inline-block w-2 h-2 rounded-full;
+    }
+    .status-online   { @apply bg-emerald-400; }
+    .status-offline  { @apply bg-red-400; }
+    .status-unknown  { @apply bg-ink-500; }
+    .status-starting { @apply bg-amber-400 animate-pulse-dot; }
+
+    /* Код */
+    pre.code {
+        @apply bg-ink-900 border border-ink-700 rounded-lg p-4 overflow-auto text-xs font-mono text-ink-200;
+    }
+}
+
+@layer utilities {
+    .text-balance { text-wrap: balance; }
+    .scrollbar-none::-webkit-scrollbar { display: none; }
+    .scrollbar-none { -ms-overflow-style: none; scrollbar-width: none; }
+    .grid-auto-cols {
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    }
+}
