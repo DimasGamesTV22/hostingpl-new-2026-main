@@ -31,6 +31,17 @@ class ConsoleController extends Controller
         private readonly ServerEventLogger $events,
     ) {}
 
+    /**
+     * Инвокаемый контроллер: маршрут задан как
+     * Route::get('/console', ConsoleController::class) внутри префикса
+     * servers/{server} — без метода. Без __invoke Laravel падает на
+     * загрузке маршрутов.
+     */
+    public function __invoke(Request $request, Server $server): View
+    {
+        return $this->show($request, $server);
+    }
+
     public function show(Request $request, Server $server): View
     {
         $this->authorize('console', $server);

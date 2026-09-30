@@ -14,6 +14,16 @@ class DashboardController extends Controller
 {
     public function __construct(private readonly WalletService $wallet) {}
 
+    /**
+     * Инвокаемый контроллер: маршрут задан как
+     * Route::get('/', DashboardController::class) — без метода.
+     * Без __invoke Laravel падает на загрузке маршрутов.
+     */
+    public function __invoke(Request $request): View
+    {
+        return $this->index($request);
+    }
+
     public function index(Request $request): View
     {
         $user = $request->user();

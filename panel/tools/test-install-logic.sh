@@ -256,7 +256,39 @@ else
     t_bad "строка с компонентом раскомментирована" "$(sed -n 1p "$TMP/sources-uncomment.list")"
 fi
 
-# Формат 4: нечего менять — в файле нет строк deb
+# Формат 4: deb822 (Ubuntu 24.04 / noble) — отдельный синтаксис, поля
+# Components:, а не список компонентов в строке deb. Старый разбор молчал бы,
+# и universe/multiverse не включились бы.
+cat > "$TMP/ubuntu.sources" <<'EOF'
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates noble-backports
+Components: main restricted
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+
+apt_add_component "$TMP/ubuntu.sources" universe
+if grep -q '^Components: main restricted universe$' "$TMP/ubuntu.sources"; then
+    t_ok "deb822: компонент дописан в Components:"
+else
+    t_bad "deb822: компонент дописан в Components:" "$(grep '^Components:' "$TMP/ubuntu.sources")"
+fi
+# Прочие поля deb822 не должны пострадать
+if grep -q '^Suites: noble noble-updates noble-backports$' "$TMP/ubuntu.sources"; then
+    t_ok "deb822: остальные поля не изменены"
+else
+    t_bad "deb822: остальные поля не изменены" "$(grep '^Suites:' "$TMP/ubuntu.sources")"
+fi
+# Повторный вызов не дублирует
+before="$(cat "$TMP/ubuntu.sources")"
+apt_add_component "$TMP/ubuntu.sources" universe || true
+if [[ $before == "$(cat "$TMP/ubuntu.sources")" ]]; then
+    t_ok "deb822: повторный вызов не дублирует компонент"
+else
+    t_bad "deb822: повторный вызов не дублирует компонент" "$(grep '^Components:' "$TMP/ubuntu.sources")"
+fi
+
+# Формат 5: нечего менять — в файле нет строк deb
 cat > "$TMP/sources-empty.list" <<'EOF'
 # только комментарии
 EOF
@@ -269,6 +301,53 @@ elif [[ $before == "$(cat "$TMP/sources-empty.list")" ]]; then
 else
     t_bad "файл без строк deb не трогаем" "файл изменён"
 fi
+
+# ── Имена PHP-пакетов ─────────────────────────────────────────────────
+#
+# Пакеты PHP называются с точкой: php8.3-fpm. Раньше в списке apt-пакетов стояло
+# ${PHP_VERSION/./}, из-за чего получалось несуществующее php83-fpm — и PHP просто
+# не ставился ни на одной системе. Здесь pkg_available подменена, чтобы «доступным»
+# был только вариант с точкой (как в реальных дистрибутивах и у packages.sury.org).
+
+head_ "php_pkg: имена PHP-пакетов"
+
+php_pkg_with() {
+    # $1 — предикат «какое имя считать доступным», остальное — вызов php_pkg
+    local pred="$1"; shift
+    PHP_VERSION="$1"; shift
+    eval "pkg_available() { $pred; }"
+    php_pkg "$@"
+}
+
+eq "каноническое имя с точкой" \
+    "$(php_pkg_with '[[ "$1" == php8.3-* ]]' 8.3 fpm)" "php8.3-fpm"
+eq "все расширения с точкой" \
+    "$(PHP_VERSION=8.3; pkg_available() { [[ "$1" == php8.3-* ]]; }; \
+       for e in fpm cli redis soap intl bcmath; do php_pkg "$e"; echo; done | tr '\n' ' ')" \
+    "php8.3-fpm php8.3-cli php8.3-redis php8.3-soap php8.3-intl php8.3-bcmath "
+
+# Сборка без точки — подхватываем, чтобы не зависеть от репозитория
+eq "подхватывает вариант без точки" \
+    "$(php_pkg_with '[[ "$1" == php83-* ]]' 8.3 fpm)" "php83-fpm"
+
+# Недоступно ничего — отдаём каноническое имя, его отфильтрует общий список
+eq "при отсутствии пакета отдаёт каноническое" \
+    "$(php_pkg_with 'return 1' 8.3 fpm)" "php8.3-fpm"
+
+# 8.10 — две цифры после точки: плоский вариант совпал бы с каноническим
+eq "версия 8.10 не двоится" \
+    "$(php_pkg_with 'return 1' 8.10 fpm)" "php8.10-fpm"
+
+# Диагностика внутри php_pkg не должна попадать в имя пакета: функцию зовут
+# как $(php_pkg …), и любой вывод в stdout стал бы частью имени.
+PHP_VERSION=8.3
+pkg_available() { [[ "$1" == php83-* ]]; }
+noise="$(php_pkg fpm 2>/dev/null)"
+eq "вывод php_pkg идёт только в имя пакета" "$noise" "php83-fpm"
+
+noise_all="$(php_pkg fpm 2>/dev/null; echo)"
+eq "в stdout нет постороннего текста" \
+    "$(printf '%s' "$noise_all" | tr -d '\n' | sed 's/ php83-fpm$//')" "php83-fpm"
 
 # ── Матрицы install.sh и agent.sh должны совпадать ────────────────────
 # Оба установщика статят на ноды и панель. Если один расширит список ОС,

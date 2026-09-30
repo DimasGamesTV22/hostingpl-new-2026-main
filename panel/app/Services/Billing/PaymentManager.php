@@ -29,8 +29,13 @@ class PaymentManager
         private readonly WalletService $wallet,
         private readonly Notifier $notifier,
         private readonly Mailer $mailer,
-        private readonly ?PromoService $promo = null,
+        // Контейнер обязан идти раньше необязательного параметра: в PHP
+        // необязательный параметр перед обязательным недопустим, и PHP 8
+        // считает $promo обязательным, выдавая предупреждение при каждой
+        // загрузке маршрутов. Порядок для внедрения Laravel не важен —
+        // он сопоставляет зависимости по имени, а не по позиции.
         private readonly Container $container,
+        private readonly ?PromoService $promo = null,
     ) {
         $this->gateways = [
             'yookassa' => $this->container->make(YooKassaGateway::class),

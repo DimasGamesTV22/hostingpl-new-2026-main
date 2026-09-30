@@ -281,8 +281,8 @@ class ServerController extends Controller
             'memory_mb' => ['required', 'integer', 'min:'.max(512, $game->min_memory_mb), 'max:'.$maxMemory],
             'cpu_percent' => ['required', 'integer', 'min:10', 'max:800'],
             'disk_mb' => ['required', 'integer', 'min:2048', 'max:'.$maxDisk],
-            'network_mbps' => ['required', 'integer', 'min:5', 'max:1000],
-            'pids' => ['required', 'integer', 'min:64', 'max:8192],
+            'network_mbps' => ['required', 'integer', 'min:5', 'max:1000'],
+            'pids' => ['required', 'integer', 'min:64', 'max:8192'],
             'slots' => ['required', 'integer', 'min:'.$game->min_slots, 'max:'.$maxSlots],
         ]);
 

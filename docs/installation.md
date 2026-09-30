@@ -22,27 +22,54 @@
 | Диск | 20 ГБ SSD | 60 ГБ SSD |
 | Домен | с A-записью на этот сервер | + Cloudflare |
 
+Установщик проверяет свободное место на разделе, который примет каталог
+`/opt/gamedock`, и просит минимум 5 ГБ (`GD_MIN_DISK_GB`), предупреждает при
+меньше 20 ГБ (`GD_RECOMMENDED_DISK_GB`). Проверяется именно существующий раздел:
+сам каталог на чистой системе появляется только в процессе установки.
+
 ### Поддерживаемые системы
 
 Установщик проверяет ОС и отказывается ставить на неподдерживаемую, печатая список.
-Матрица живёт в одной переменной `SUPPORTED_SYSTEMS` в начале `deploy/install.sh`.
+Матрица живёт в одной переменной `SUPPORTED_SYSTEMS` в начале `deploy/install.sh`
+и продублирована в `deploy/agent.sh`; расхождение между ними и с этой таблицей
+ловит `node panel/tools/check-distros.cjs`.
 
-| Система | Кодовое имя | PHP в дистрибутиве | Что делает установщик |
-|---|---|---|---|
-| Debian 11 | bullseye | 7.4 | подключает `packages.sury.org`, ставит PHP 8.3 |
-| Debian 12 | bookworm | 8.2 | берёт PHP из дистрибутива |
-| Debian 13 | trixie | 8.4 | берёт PHP из дистрибутива |
-| Ubuntu 22.04 | jammy | 8.1 | подключает `packages.sury.org`, ставит PHP 8.3 |
-| Ubuntu 24.04 | noble | 8.3 | берёт PHP из дистрибутива |
+| Система | Кодовое имя | PHP в дистрибутиве | PHP ставится | Что делает установщик |
+|---|---|---|---|---|
+| Debian 11 | bullseye | 7.4 | 8.3 | подключает `packages.sury.org` |
+| Debian 12 | bookworm | 8.2 | 8.2 | берёт PHP из дистрибутива |
+| Debian 13 | trixie | 8.4 | 8.4 | берёт PHP из дистрибутива |
+| Ubuntu 22.04 | jammy | 8.1 | 8.3 | подключает `packages.sury.org` |
+| Ubuntu 24.04 | noble | 8.3 | 8.3 | берёт PHP из дистрибутива |
 
-Дополнительно установщик всегда подключает **NodeSource** (Node.js 20 — нужен агенту)
-и **docker.com** (если выбран рантайм `docker`), потому что в самих дистрибутивах
-подходящих версий нет.
+Laravel 11 требует PHP ≥ 8.2, поэтому там, где в дистрибутиве версия ниже,
+подключается `packages.sury.org` — официальный репозиторий PHP, который ведёт
+и Debian, и Ubuntu.
+
+Дополнительно установщик всегда подключает **NodeSource** (Node.js 20 — нужен
+агенту) и **docker.com** (если выбран рантайм `docker`), потому что в самих
+дистрибутивах подходящих версий нет. На Ubuntu 24.04 sources-файлы в формате
+deb822 — установщик умеет править оба формата (`deb …` и `Components: …`).
+
+Версию PHP можно задать принудительно:
+
+```bash
+sudo ./install.sh --php 8.3 …
+```
 
 Отдельная тонкость: **Debian 11 по умолчанию использует cgroup v1**, а рантайм
 `native` без cgroup v2 не работает. Установщик это обнаружит и предложит включить
 v2 через параметр ядра (потребуется перезагрузка и повторный запуск). Рантаймы
 `docker` и `podman` от этого не зависят.
+
+Проверить матрицу и логику без установки:
+
+```bash
+node panel/tools/check-distros.cjs      # матрица согласована с документацией
+bash panel/tools/test-install-logic.sh  # 70 проверок: detect_distro, apt, PHP-пакеты
+bash panel/tools/test-menu.sh           # 33 проверки: меню, подменю, гейт на веб-сервер
+bash panel/tools/test-system-checks.sh  # 23 проверки: диск, лог-файл, чистая машина
+```
 
 Полные требования — в [requirements.md](requirements.md).
 
@@ -62,15 +89,50 @@ dig +short panel.example.com
 
 ### Шаг 2. Запуск
 
+**Вариант 1 — меню** (рекомендуется). Одно окно со всеми операциями:
+
 ```bash
-# Интерактивно — установщик задаст вопросы
-curl -fsSL https://raw.githubusercontent.com/your-org/gamedock/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/menu.sh | sudo bash
+```
+
+```
+==============================================================================
+==========
+- - Добро пожаловать в меню автоустановщика GameDock 1.0.0! - -
+==============================================================================
+   Панель: нет   Веб: нет   Агент: нет
+
+ - 1 -   Настроить VDS/VPS под WEB Server (LAMP) для панели!
+ - 2 -   Установка панели хостинга GameDock!
+ - 3 -   Настроить VDS/VPS под игровые серверы (Java, SteamCMD)!
+ - 4 -   Установить/обновить агента ноды!
+ - 5 -   Открыть меню CRON/BACKUP!
+ - 6 -   Открыть меню СЛУЖБЫ!
+ - 7 -   Открыть меню СОСТОЯНИЕ!
+ - 8 -   Установить ВСЁ в один клик (панель + агент)!
+ - 0 -   Выход
+================================== GAMEDOCK ==================================
+Пожалуйста, введите пункт меню:
+```
+
+Пункты 5–7 открывают подменю, из любого подменю возвращаемся по `0`.
+Строки `Панель: … Веб: … Агент: …` показывают текущее состояние машины, а
+уже установленные пункты помечены `[уже стоит]`.
+
+> **Пункт 2 требует веб-сервер.** Если nginx/Apache не найден, установщик
+> предложит его поставить или вернёт вас в меню к пункту 1. Ставьте
+> веб-сервер раньше панели — либо сразу используйте пункт 8 («всё в один клик»).
+
+**Вариант 2 — без меню**, одной командой и без вопросов:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/install.sh | sudo bash
 ```
 
 Либо скачайте и запустите с параметрами:
 
 ```bash
-wget https://raw.githubusercontent.com/your-org/gamedock/main/deploy/install.sh
+wget https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/install.sh
 chmod +x install.sh
 
 sudo ./install.sh \
@@ -81,6 +143,46 @@ sudo ./install.sh \
   --runtime docker \
   --with-agent
 ```
+
+#### phpMyAdmin
+
+Устанавливается по умолчанию и публикуется на домене панели по адресу
+`https://<домен>/phpmyadmin/`. Вход закрыт паролем, который установщик
+создаёт и печатает в конце установки, а также кладёт в
+`/root/.gamedock-phpmyadmin.txt` (права `600`).
+
+Это **отдельная учётка nginx**, а не запись в базе: перебором по самой базе
+до интерфейса не добраться. Пароль при повторном запуске установщика не
+меняется.
+
+```bash
+# Только с вашего IP — самый надёжный способ закрыть интерфейс
+sudo ./install.sh --domain panel.example.com --email admin@example.com \
+  --pma-allow "203.0.113.10,198.51.100.7"
+
+# Другой адрес и имя учётки
+sudo ./install.sh --pma-path /db --pma-user admin
+
+# Не ставить вовсе
+sudo ./install.sh --no-phpmyadmin
+```
+
+| Что | Где |
+|---|---|
+| Конфиг nginx | `/etc/nginx/snippets/gamedock-phpmyadmin.conf` |
+| Пароли для входа | `/etc/nginx/.htpasswd-gamedock` (640) |
+| Логин и пароль открытым текстом | `/root/.gamedock-phpmyadmin.txt` (600) |
+| Логи доступа | `/var/log/nginx/phpmyadmin-access.log` |
+
+phpMyAdmin ставится пакетом `phpmyadmin` с ключом `--no-install-recommends`:
+без него `apt` тянет Apache (в `Recommends` пакета стоит
+`libapache2-mod-php | lighttpd | nginx | …`) и второй PHP из Debian рядом с
+тем, что установщик ставит с `packages.sury.org`. На Debian 13 оба лишних
+пакета — Apache и PHP 8.5 — при `--no-install-recommends` не ставятся.
+
+Доступ к файлам панели закрыт через `open_basedir`: phpMyAdmin видит свои
+каталоги и `/usr/share/php` (там Debian держит общие библиотеки), но не
+видит `.env` панели с паролем от базы.
 
 ### Шаг 3. Что спрашивает установщик
 
@@ -158,6 +260,10 @@ systemctl status gamedock-queue@1
 # Сайт
 curl -I https://panel.example.com
 
+# phpMyAdmin: без пароля должен быть 401, с паролем — 200
+curl -o /dev/null -w '%{http_code}\n' https://panel.example.com/phpmyadmin/
+sudo cat /root/.gamedock-phpmyadmin.txt   # логин и пароль для входа
+
 # Диагностика
 cd /opt/gamedock/panel
 sudo -u gamedock php artisan gamedock doctor
@@ -178,7 +284,7 @@ sudo -u gamedock php artisan gamedock doctor
 2. Скопируйте токен ноды (показывается один раз)
 
 3. На САМОЙ ноде:
-     wget https://raw.githubusercontent.com/your-org/gamedock/main/deploy/agent.sh
+     wget https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/agent.sh
      chmod +x agent.sh
      sudo ./agent.sh --panel https://panel.example.com --token <ТОКЕН> --runtime docker
 
@@ -211,7 +317,7 @@ sudo systemctl restart gamedock-wss
 Подходит для теста и разработки. В продакшене на выделенном сервере вариант A надёжнее.
 
 ```bash
-git clone https://github.com/your-org/gamedock.git
+git clone https://github.com/DimasGamesTV22/hostingpl-new-2026-main.git
 cd gamedock
 
 cp .env.docker.example .env
@@ -292,7 +398,7 @@ chmod 750 /home/gamedock/servers /home/gamedock/backups
 ### 3. Код
 
 ```bash
-git clone https://github.com/your-org/gamedock.git /opt/gamedock
+git clone https://github.com/DimasGamesTV22/hostingpl-new-2026-main.git /opt/gamedock
 cp -a /opt/gamedock/panel/. /opt/gamedock/panel/
 
 cd /opt/gamedock/panel

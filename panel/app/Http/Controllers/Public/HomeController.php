@@ -15,6 +15,18 @@ class HomeController extends Controller
 {
     public function __construct(private readonly PublicStatusService $public) {}
 
+    /**
+     * Инвокаемый контроллер.
+     *
+     * Маршрут задан строкой без метода — Route::get('/', HomeController::class).
+     * Laravel в этом случае требует __invoke и без него падает ещё на этапе
+     * загрузки маршрутов: «Invalid route action», а не при первом запросе.
+     */
+    public function __invoke(): View
+    {
+        return $this->index();
+    }
+
     public function index(): View
     {
         return view('public.index', [

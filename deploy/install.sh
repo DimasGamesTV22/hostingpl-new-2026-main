@@ -14,7 +14,7 @@
 # и выбирает версию по таблице выше.
 #
 # Запуск:
-#   curl -fsSL https://raw.githubusercontent.com/your-org/gamedock/main/deploy/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/install.sh | sudo bash
 #
 # Или с параметрами:
 #   sudo ./install.sh --domain panel.example.com --email admin@example.com --runtime docker
@@ -29,6 +29,13 @@
 #   7. Спрашивает про платежи, маркетинг и режим нод — и записывает в config/hosting.php
 #   8. Опционально ставит локальный агент (если эта машина ещё и нода)
 #
+# Скрипт написан на bash: массивы, [[ ]], process substitution, for (( … )).
+# Если его запустили через sh (на Debian это dash), он бы упал с
+# «[: not found» и «Bad for loop variable». Поэтому перезапускаем себя под bash.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════
@@ -36,12 +43,25 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════
 
 GAMEDOCK_VERSION="${GAMEDOCK_VERSION:-1.0.0}"
+GAMEDOCK_REPO_URL="${GAMEDOCK_REPO:-https://github.com/DimasGamesTV22/hostingpl-new-2026-main.git}"
+GAMEDOCK_BRANCH="${GAMEDOCK_BRANCH:-main}"
 INSTALL_DIR="${GAMEDOCK_INSTALL_DIR:-/opt/gamedock}"
 PANEL_DIR="$INSTALL_DIR/panel"
 AGENT_DIR="$INSTALL_DIR/agent"
 GAME_IMAGES_DIR="${GAME_IMAGES_DIR:-/opt/gamedock/game-images}"
 STATE_DIR=/var/lib/gamedock
 LOG_FILE=/var/log/gamedock-install.log
+
+# phpMyAdmin — веб-интерфейс к базам. Ставится по умолчанию, но доступ
+# закрыт паролем nginx, а не открыт всему интернету.
+WITH_PHPMYADMIN="${GD_WITH_PHPMYADMIN:-yes}"
+PHPMYADMIN_PATH="${GD_PHPMYADMIN_PATH:-/phpmyadmin}"
+PHPMYADMIN_ALLOW="${GD_PHPMYADMIN_ALLOW:-}"
+PHPMYADMIN_USER="${GD_PHPMYADMIN_USER:-gamedock}"
+PHPMYADMIN_SNIPPET=/etc/nginx/snippets/gamedock-phpmyadmin.conf
+PHPMYADMIN_HTPASSWD=/etc/nginx/.htpasswd-gamedock
+PHPMYADMIN_CREDS=/root/.gamedock-phpmyadmin.txt
+PHPMYADMIN_URL=""
 
 DB_NAME="${GD_DB_NAME:-gamedock}"
 DB_USER="${GD_DB_USER:-gamedock}"
@@ -71,6 +91,11 @@ INSTALL_REDIS="yes"
 PHP_VERSION="${GD_PHP_VERSION:-}"
 MIN_PHP_MAJOR=8
 MIN_PHP_MINOR=2
+
+# Требования к месту. MIN — жёсткий минимум, без которого установка не имеет
+# смысла; RECOMMENDED — сколько нужно, чтобы ещё влезли файлы игр и бэкапы.
+MIN_DISK_GB="${GD_MIN_DISK_GB:-5}"
+RECOMMENDED_DISK_GB="${GD_RECOMMENDED_DISK_GB:-20}"
 
 # Версия Node.js для агента. Агент требует >= 20.
 NODE_MAJOR="${GD_NODE_MAJOR:-20}"
@@ -121,11 +146,62 @@ TELEMETRY="no"
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
 BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 
-log()   { echo -e "${BLUE}[GameDock]${NC} $*" | tee -a "$LOG_FILE"; }
-ok()    { echo -e "${GREEN}✓${NC} $*" | tee -a "$LOG_FILE"; }
-warn()  { echo -e "${YELLOW}!${NC} $*" | tee -a "$LOG_FILE"; }
-fail()  { echo -e "${RED}✗${NC} $*" | tee -a "$LOG_FILE"; exit 1; }
-step()  { echo; echo -e "${BOLD}${CYAN}▸ $*${NC}" | tee -a "$LOG_FILE"; }
+# Печать в консоль и в лог-файл.
+#
+# Раньше здесь был `echo … | tee -a "$LOG_FILE"`. При `set -euo pipefail`
+# недоступный лог-файл (нет прав на /var/log, read-only FS, не-root в
+# контейнере) обрывал установку ещё на первом сообщении — с невнятным
+# «Permission denied» вместо установки. Теперь недоступный лог не мешает.
+_emit() {
+    local color="$1"
+    shift
+
+    echo -e "${color}$*${NC}"
+
+    if [[ -n ${LOG_FILE:-} ]] && : >>"$LOG_FILE" 2>/dev/null; then
+        echo -e "$*" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+# Выполнить команду, показать хвост вывода, полный вывод записать в лог.
+#
+# Нужна вместо `cmd | tee -a "$LOG_FILE" | tail -N`: при `set -o pipefail`
+# падение tee из-за недоступного лог-файла делало пайп «неуспешным», и
+# успешная установка пакетов выглядела как ошибка. Здесь вывод команды
+# сначала забирается целиком, и статус берётся у самой команды.
+#
+# $1 — сколько строк показать в консоль, остальное — команда.
+run_logged() {
+    local tail_n="$1"
+    shift
+    local -a cmd=("$@")
+
+    local out rc=0
+    # stdin закрываем: команда выполняется в подстановке `$(...)`, где stdin
+    # иначе наследуется от терминала, и любой вопрос (debconf, needrestart)
+    # держит установку, пока пользователь не нажмёт Enter. Здесь нужен отказ
+    # сразу, а не ожидание ввода: все команды, проходящие через run_logged
+    # (apt-get, nginx -t, certbot --agree-tos), интерактивного ввода не имеют.
+    out="$("${cmd[@]}" </dev/null 2>&1)" || rc=$?
+
+    if [[ -n ${LOG_FILE:-} ]] && : >>"$LOG_FILE" 2>/dev/null; then
+        printf '%s\n' "$out" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+
+    if [[ -n $out ]]; then
+        printf '%s\n' "$out" | tail -n "$tail_n"
+    fi
+
+    return "$rc"
+}
+
+# Пробел-разделитель лежит ВНУТРИ цвета — иначе он попал бы под следующий
+# прогон и выглядел бы как отступ, а не как разделитель символа и текста.
+log()   { _emit "${BLUE}[GameDock]${NC} " "$*"; }
+ok()    { _emit "${GREEN}✓${NC} " "$*"; }
+warn()  { _emit "${YELLOW}!${NC} " "$*"; }
+fail()  { _emit "${RED}✗${NC} " "$*"; exit 1; }
+step()  { echo; _emit "${BOLD}${CYAN}▸ ${NC}" "$*"; }
 
 ask() {
     local prompt="$1" default="$2" answer
@@ -199,6 +275,10 @@ parse_args() {
             --node-major)    NODE_MAJOR="$2"; shift 2 ;;
             --queue-workers) QUEUE_WORKERS="$2"; shift 2 ;;
             --dir)           INSTALL_DIR="$2"; shift 2 ;;
+            --no-phpmyadmin) WITH_PHPMYADMIN="no"; shift ;;
+            --pma-path)      PHPMYADMIN_PATH="$2"; shift 2 ;;
+            --pma-user)      PHPMYADMIN_USER="$2"; shift 2 ;;
+            --pma-allow)     PHPMYADMIN_ALLOW="$2"; shift 2 ;;
             --yes|-y)        INTERACTIVE=0; shift ;;
             --help|-h)       show_help; exit 0 ;;
             *) fail "Неизвестный параметр: $1 (см. --help)" ;;
@@ -235,6 +315,14 @@ GameDock — установщик панели управления игровы
   --node-major <N>        Старшая версия Node.js для агента (по умолчанию 20)
   --queue-workers <N>     Количество процессов очереди (по умолчанию 2)
   --dir <путь>            Каталог установки (по умолчанию /opt/gamedock)
+
+phpMyAdmin (веб-доступ к базам MySQL/MariaDB):
+  --no-phpmyadmin         Не ставить phpMyAdmin
+  --pma-path <путь>       Адрес phpMyAdmin (по умолчанию /phpmyadmin)
+  --pma-user <имя>        Имя учётки для входа (по умолчанию gamedock)
+  --pma-allow "IP,IP"     Пускать только с этих IP (по умолчанию — с любого)
+                         Вход в phpMyAdmin всегда закрыт паролем, который
+                         установщик создаёт и печатает в конце.
   -y, --yes               Без диалога, все ответы по умолчанию
 
 Пример (полностью автоматически):
@@ -406,6 +494,39 @@ check_root() {
     [[ $EUID -eq 0 ]] || fail "Запускать от root: sudo ./install.sh"
 }
 
+# Сколько гигабайт свободно на разделе, который примет указанный каталог.
+#
+# Сам INSTALL_DIR на чистой системе ещё не создан: его создаёт create_service_user,
+# а проверка места идёт раньше. Если спросить df прямо у несуществующего пути,
+# он вернёт ошибку, результат окажется пустым, и установщик честно напишет
+# «доступно 0 ГБ» на машине с полным диском. Поэтому поднимаемся до ближайшего
+# существующего родителя.
+#
+# Используем df -P: флаг POSIX гарантирует ровно одну строку на файловую систему,
+# поэтому «строка 2» — это всегда сводная строка, независимо от ширины терминала.
+avail_gb_for() {
+    local dir="${1:-/}"
+    local parent
+
+    while [[ -n $dir && ! -d $dir ]]; do
+        parent="${dir%/*}"
+        # корень или каталог без слеша — дальше идти некуда
+        [[ -z $parent || $parent == "$dir" ]] && break
+        dir="$parent"
+    done
+
+    [[ -d $dir ]] || dir="/"
+
+    local avail
+    avail=$(df -PBG "$dir" 2>/dev/null | awk 'NR==2 { gsub(/G/, "", $4); print $4 }')
+
+    # Не число (пусто, «-», ошибка) — честно считаем нулём, но вызывающий
+    # код увидит, что измерять нечего, и скажет об этом пользователю.
+    [[ $avail =~ ^[0-9]+$ ]] || avail=0
+
+    printf '%s' "$avail"
+}
+
 check_system() {
     step "Проверка системы"
 
@@ -415,67 +536,216 @@ check_system() {
     kernel="$(uname -r)"
 
     # Проверка свободного места
-    local avail_gb
-    avail_gb=$(df -BG --output=avail "$INSTALL_DIR" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
+    local probe_dir avail_gb
+    probe_dir="$INSTALL_DIR"
+    while [[ -n $probe_dir && ! -d $probe_dir ]]; do
+        probe_dir="${probe_dir%/*}"
+        [[ -z $probe_dir ]] && probe_dir="/"
+    done
 
-    if (( avail_gb < 5 )); then
-        fail "Мало места: доступно ${avail_gb} ГБ, нужно минимум 5 ГБ"
+    avail_gb="$(avail_gb_for "$INSTALL_DIR")"
+
+    if (( avail_gb < MIN_DISK_GB )); then
+        fail "Мало места: на разделе ${probe_dir} свободно ${avail_gb} ГБ, нужно минимум ${MIN_DISK_GB} ГБ.
+
+Каталог установки: ${INSTALL_DIR}
+Рекомендуется ${RECOMMENDED_DISK_GB} ГБ — там разместятся панель, база и файлы игр."
     fi
 
-    ok "$OS_PRETTY_NAME, ядро ${kernel}, свободно ${avail_gb} ГБ"
+    if (( avail_gb < RECOMMENDED_DISK_GB )); then
+        warn "Свободно ${avail_gb} ГБ — установка пройдёт, но для игр лучше ${RECOMMENDED_DISK_GB} ГБ"
+    fi
+
+    ok "$OS_PRETTY_NAME, ядро ${kernel}, свободно ${avail_gb} ГБ на ${probe_dir}"
+}
+
+# Минимальный набор, без которого установщик не может начать.
+#
+# Раньше эти утилиты только проверялись, а ставились сильно ниже — на чистой
+# Debian (где git и unzip не входят в минимальный образ) установщик упирался
+# в «Не найдена утилита git» и выходил, не имея возможности поставить его сам.
+# Теперь доставляем недостающее автоматически.
+#
+# Пакеты и команды — разные списки, и это важно. `command -v ca-certificates`
+# не найдёт ничего: ca-certificates — это пакет, а команда называется
+# update-ca-certificates. Смешав списки, мы ловили «Не найдена утилита
+# ca-certificates» на любой машине, где чего-то не хватало.
+BASE_PACKAGES=(ca-certificates curl git tar unzip)
+BASE_COMMANDS=(curl git tar unzip)
+
+ensure_base_tools() {
+    step "Базовые утилиты"
+
+    local missing=()
+    local tool
+    for tool in "${BASE_COMMANDS[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+
+    if (( ${#missing[@]} == 0 )); then
+        ok "Базовые утилиты на месте"
+        return 0
+    fi
+
+    warn "Не хватает: ${missing[*]} — доустанавливаю"
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    if ! apt-get update -qq; then
+        warn "apt-get update не отработал — пробую поставить без обновления индексов"
+    fi
+
+    # К недостающему добавляем ca-certificates: без него HTTPS к
+    # packages.sury.org и NodeSource не установится.
+    local -a need=("${missing[@]}")
+    local p
+    for p in "${BASE_PACKAGES[@]}"; do
+        [[ " ${need[*]} " == *" $p "* ]] || need+=("$p")
+    done
+
+    if ! apt-get install -y -qq --no-install-recommends "${need[@]}" </dev/null; then
+        fail "Не удалось поставить: ${need[*]}
+
+Поставьте их вручную и запустите установщик снова:
+  apt update && apt install -y ${need[*]}"
+    fi
+
+    ok "Базовые утилиты установлены"
 }
 
 check_deps() {
     step "Проверка зависимостей"
 
-    for cmd in curl git unzip tar; do
-        command -v $cmd >/dev/null 2>&1 || fail "Не найдена утилита $cmd"
+    local cmd
+    for cmd in "${BASE_COMMANDS[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || fail "Не найдена утилита $cmd"
     done
 
-    ok "Базовые утилиты на месте"
+    ok "Все зависимости на месте"
+}
+
+# Скопировать каталог, если источник и приёмник не одно и то же место.
+#
+# Обычное дело, а не редкий случай: когда исходники уже лежат в каталоге
+# установки (REPO_DIR == INSTALL_DIR), то PANEL_DIR == REPO_DIR/panel и
+# AGENT_DIR == REPO_DIR/agent. Копирование панели в саму себя давало
+# «cp: '…/panel/./.' and '…/panel/./.' are the same file» и обрывало
+# установку. Для game-images было хуже: там стояло `2>/dev/null || true`,
+# ошибка проглатывалась, и каталог молча не обновлялся.
+copy_tree() {
+    local src="$1" dst="$2" label="${3:-каталог}"
+    local src_abs dst_abs
+
+    src_abs="$(cd "$src" 2>/dev/null && pwd -P)" || {
+        warn "$label: нет исходников в $src — пропускаю"
+        return 1
+    }
+    mkdir -p "$dst"
+    dst_abs="$(cd "$dst" 2>/dev/null && pwd -P)" || {
+        warn "$label: не удалось подготовить $dst"
+        return 1
+    }
+
+    if [[ $src_abs == "$dst_abs" ]]; then
+        log "$label: уже на месте ($dst_abs) — копирование не нужно"
+        return 0
+    fi
+
+    # Хвостовой "/." переносит содержимое, включая скрытые файлы, внутрь
+    # приёмника, а не сам каталог.
+    cp -a "$src_abs/." "$dst_abs/" || {
+        warn "$label: не удалось скопировать $src_abs → $dst_abs"
+        return 1
+    }
 }
 
 detect_repo() {
     step "Определение исходников"
 
+    # Порядок источников важен:
+    #   1) уже установленный репозиторий в $INSTALL_DIR;
+    #   2) исходники рядом с самим скриптом (локальная сборка из git clone);
+    #   3) официальный репозиторий — это нужно для `curl … | sudo bash`,
+    #      где скрипт запускается из /dev/stdin и соседей не видно;
+    #   4) в крайнем случае спрашиваем у пользователя.
     if [[ -d "$INSTALL_DIR/.git" ]]; then
         REPO_DIR="$INSTALL_DIR"
         ok "Использую локальный репозиторий: $REPO_DIR"
         return
     fi
 
-    local url="${GAMEDOCK_REPO:-}"
-    local branch="${GAMEDOCK_BRANCH:-main}"
+    if [[ -n ${BASH_SOURCE[0]:-} && -f "${BASH_SOURCE[0]}" ]]; then
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        local candidate
+        candidate="$(dirname "$script_dir")"
 
-    if [[ -z $url ]]; then
-        if [[ -n ${BASH_SOURCE[0]:-} && -f "${BASH_SOURCE[0]}" ]]; then
-            local script_dir
-            script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-            local candidate
-            candidate="$(dirname "$script_dir")"
-
-            if [[ -d "$candidate/panel" && -d "$candidate/agent" ]]; then
-                REPO_DIR="$candidate"
-                ok "Исходники найдены рядом с установщиком: $REPO_DIR"
-                return
-            fi
+        if [[ -d "$candidate/panel" && -d "$candidate/agent" ]]; then
+            REPO_DIR="$candidate"
+            ok "Исходники найдены рядом с установщиком: $REPO_DIR"
+            return
         fi
-
-        read -rp "URL репозитория GameDock: " url
     fi
 
+    local url="$GAMEDOCK_REPO_URL"
+    local branch="$GAMEDOCK_BRANCH"
+
+    [[ -n $url ]] || read -rp "URL репозиторий GameDock: " url
     [[ -n $url ]] || fail "Не указан URL репозитория"
 
-    mkdir -p "$INSTALL_DIR"
     REPO_DIR="$INSTALL_DIR"
+    mkdir -p "$REPO_DIR"
 
-    if [[ -d "$REPO_DIR/.git" ]]; then
-        log "Обновляю репозиторий…"
-        git -C "$REPO_DIR" pull --ff-only || warn "git pull не удался, продолжаю с текущей версией"
-    else
-        log "Клонирую репозиторий $url…"
-        git clone --depth 1 --branch "$branch" "$url" "$REPO_DIR" || fail "git clone не удался"
+    # Клонируем во временный каталог, а не прямо в $REPO_DIR.
+    #
+    # git отказывается клонировать в непустой каталог, а $INSTALL_DIR на
+    # повторном запуске непустой: там уже может лежать game-images от
+    # предыдущей неудачной попытки. Обход — клонируем отдельно и переносим
+    # содержимое, ничего не удаляя.
+    local staging
+    staging="$(mktemp -d /tmp/gamedock-clone.XXXXXX)" || {
+        fail "Не удалось создать временный каталог для клонирования"
+    }
+
+    if [[ -n "$(ls -A "$REPO_DIR" 2>/dev/null)" ]]; then
+        warn "Каталог $REPO_DIR не пуст — перенесу исходники поверх, ничего не удаляя"
     fi
+
+    log "Клонирую репозиторий $url…"
+
+    if ! git clone --depth 1 --branch "$branch" "$url" "$staging"; then
+        rm -rf "$staging"
+        fail "Не удалось клонировать репозиторий
+
+  Адрес: $url
+  Ветка: $branch
+
+Частые причины:
+
+  1) Репозиторий приватный. Проверьте, что он открыт, либо положите
+     исходники рядом с установщиком — тогда он возьмёт их с диска
+     и в интернет не пойдёт.
+
+  2) Адрес неверный. Уточните его и запустите с подстановкой:
+       GAMEDOCK_REPO_URL=https://github.com/ВАШ-АККАУНТ/ВАШ-РЕПО.git \\
+           bash install.sh ...
+
+  3) Нет доступа в интернет. Тогда скопируйте репозиторий на сервер
+     через scp и запустите установщик из его корня:
+       scp -r gamedock root@СЕРВЕР:/root/gamedock
+       cd /root/gamedock && bash deploy/install.sh ..."
+    fi
+
+    # Переносим содержимое клона (включая .git) в каталог установки.
+    # Через copy_tree: он и сравнивает канонические пути, и не даёт скопировать
+    # каталог сам в себя, если REPO_DIR вдруг совпадёт с временным.
+    copy_tree "$staging" "$REPO_DIR" "исходники" || {
+        rm -rf "$staging"
+        fail "Не удалось перенести исходники в $REPO_DIR — проверьте права и свободное место"
+    }
+
+    rm -rf "$staging"
+    ok "Исходники развёрнуты в $REPO_DIR"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -490,9 +760,26 @@ apt_update() {
 
 # Добавляет компонент репозитория (main/contrib/universe/…) в sources-файл.
 # Возвращает 0, если файл изменён, 1 — если компонент уже был.
+#
+# Поддерживаются оба формата apt:
+#   • классический  — `deb http://… jammy main restricted`  (Ubuntu 22.04 и старше);
+#   • deb822        — блок `Components: main restricted`  (Ubuntu 24.04 / noble).
+# На noble старый парсер молчал бы, и universe/multiverse не включились бы.
 apt_add_component() {
     local file="$1" comp="$2"
 
+    # ── deb822: поле Components: ─────────────────────────────────────
+    if grep -qE '^[[:space:]]*Components:[[:space:]]' "$file"; then
+        if grep -qE "^[[:space:]]*Components:.*\\b${comp}\\b" "$file"; then
+            return 1
+        fi
+
+        # Дописываем компонент в каждую строку Components:
+        sed -i -E "s/^([[:space:]]*Components:[[:space:]]*)(.*)\$/\\1\\2 ${comp}/" "$file"
+        return 0
+    fi
+
+    # ── классический формат ─────────────────────────────────────────
     # Компонент уже есть в активной строке — ничего не делаем
     if grep -qE "^[[:space:]]*deb(-src)?[[:space:]].*\b${comp}\b" "$file"; then
         return 1
@@ -516,6 +803,11 @@ apt_add_component() {
 
 # Включает дополнительные компоненты репозитория: без них не находятся
 # steamcmd, php-redis и часть заголовков для сборки игр.
+#
+# Сначала правим sources-файлы сами — это работает и на классическом формате,
+# и на deb822, и не зависит от software-properties-common (которого на
+# минимальной системе ещё нет на этом шаге). add-apt-repository оставлен
+# как запасной путь.
 enable_apt_components() {
     log "Включаю дополнительные компоненты репозитория…"
 
@@ -526,20 +818,24 @@ enable_apt_components() {
         want=(main contrib non-free non-free-firmware)
     fi
 
-    if command -v add-apt-repository >/dev/null 2>&1; then
+    local file comp changed=0
+
+    for file in /etc/apt/sources.list \
+                /etc/apt/sources.list.d/*.sources \
+                /etc/apt/sources.list.d/*.list; do
+        [[ -f $file ]] || continue
+
+        for comp in "${want[@]}"; do
+            if apt_add_component "$file" "$comp"; then
+                log "  + ${comp} → $(basename "$file")"
+                changed=1
+            fi
+        done
+    done
+
+    if [[ $changed -eq 0 ]] && command -v add-apt-repository >/dev/null 2>&1; then
         for comp in "${want[@]}"; do
             add-apt-repository -y "$comp" >/dev/null 2>&1 || true
-        done
-    else
-        # Без software-properties-common правим sources-файлы вручную
-        local file comp
-        for file in /etc/apt/sources.list \
-                    /etc/apt/sources.list.d/"$OS_ID"*.sources \
-                    /etc/apt/sources.list.d/"$OS_ID"*.list; do
-            [[ -f $file ]] || continue
-            for comp in "${want[@]}"; do
-                apt_add_component "$file" "$comp" || true
-            done
         done
     fi
 
@@ -547,9 +843,63 @@ enable_apt_components() {
     ok "Компоненты репозитория включены"
 }
 
-# Пакет доступен в текущих репозиториях?
+# Пакет ДОСТУПЕН ДЛЯ УСТАНОВКИ?
+#
+# `apt-cache show` отвечает «есть» и для пакета, который в индексе есть, но
+# установить его нельзя: на Debian 13 openjdk-17-jre-headless и steamcmd именно
+# такие — строки в индексе есть, а Candidate: (none). Проверяем кандидата.
 pkg_available() {
-    apt-cache show "$1" >/dev/null 2>&1
+    local candidate
+    candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    [[ -n $candidate && $candidate != "(none)" ]]
+}
+
+# Первая доступная версия Java.
+#
+# На Debian 13 (trixie) OpenJDK 17 удалён из репозиториев — остались 21 и 25.
+# На Debian 11/12 наоборот, 21 может не быть. Поэтому не фиксируем версию,
+# а берём первую, которая реально ставится: 21 предпочтительна (Paper и
+# новые версии Minecraft требуют именно её), 17 — запасной вариант.
+java_package() {
+    local v
+    for v in 21 17 25; do
+        if pkg_available "openjdk-${v}-jre-headless"; then
+            printf 'openjdk-%s-jre-headless' "$v"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Имя пакета расширения PHP для текущей $PHP_VERSION.
+#
+# Каноническое имя — с точкой: php8.3-fpm, php8.3-redis. Именно так их называют
+# и дистрибутивы, и packages.sury.org. Но встречаются сборки без точки
+# (php83-fpm), поэтому проверяем оба варианта и берём существующий —
+# так установщик не зависит от особенностей конкретного репозитория.
+# Если не найден ни один, возвращаем каноническое имя: его затем отфильтрует
+# общий список «доступных пакетов» и покажет в предупреждении.
+#
+# ВАЖНО: функцию зовут как $(php_pkg …), поэтому всё, что она печатает,
+# становится именем пакета. Диагностика уходит в stderr, а не в stdout.
+php_pkg() {
+    local ext="$1"
+    local dotted="php${PHP_VERSION}-${ext}"
+    local flat="php${PHP_VERSION//./}-${ext}"
+
+    if [[ $flat == "$dotted" ]]; then
+        printf '%s' "$dotted"
+        return
+    fi
+
+    if pkg_available "$dotted"; then
+        printf '%s' "$dotted"
+    elif pkg_available "$flat"; then
+        log "  пакет ${ext}: ${dotted} нет, беру ${flat}" >&2
+        printf '%s' "$flat"
+    else
+        printf '%s' "$dotted"
+    fi
 }
 
 # ── Репозиторий PHP (packages.sury.org) ───────────────────────────
@@ -561,13 +911,41 @@ setup_sury_php() {
         return
     fi
 
+    # Репозиторий уже подключён — не качаем ключ заново. Иначе каждый повторный
+    # запуск упирается в сеть, хотя подключать уже нечего.
+    if [[ -s /usr/share/keyrings/sury-php.gpg && -s /etc/apt/sources.list.d/sury-php.list ]]; then
+        log "Репозиторий packages.sury.org уже подключён"
+        return 0
+    fi
+
     log "Подключаю packages.sury.org для PHP…"
 
     apt-get install -y -qq --no-install-recommends ca-certificates apt-transport-https \
-        lsb-release curl gnupg >/dev/null
+        lsb-release curl gnupg >/dev/null </dev/null
 
-    curl -fsSL "https://packages.sury.org/php/apt.gpg" \
-        -o /usr/share/keyrings/sury-php.gpg
+    # Через повторы: если внешний хост не ответит с первого раза, установка
+    # не должна обрываться. Плюс скачиваем во временный файл, а не в пайп —
+    # при пустом входе gpg падает, а под pipefail это уронило бы весь скрипт.
+    local sury_key
+    sury_key="$(mktemp)"
+    if fetch_with_retry "https://packages.sury.org/php/apt.gpg" "$sury_key"; then
+        install -m 0644 "$sury_key" /usr/share/keyrings/sury-php.gpg
+    else
+        rm -f "$sury_key"
+        fail "Не удалось скачать ключ packages.sury.org.
+
+Через него подключается репозиторий PHP. Без него панель работать не будет:
+Laravel 11 требует PHP 8.2 или новее, а в самом дистрибутиве бывает 7.4.
+
+Что делать:
+  1) Проверьте доступ в интернет и запустите установщик снова.
+  2) Если хост недоступен из вашей сети — скачайте ключ на любой машине
+     и положите на сервер, затем повторите:
+       curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
+  3) Узнать заранее, какую версию PHP поставит установщик:
+       bash install.sh --php 8.3 --help"
+    fi
+    rm -f "$sury_key"
 
     local codename="$OS_CODENAME"
     [[ -n $codename ]] || { warn "Нет кодового имени — репозиторий PHP не подключён"; return; }
@@ -587,11 +965,19 @@ SURYEOF
 setup_nodejs_repo() {
     log "Подключаю NodeSource для Node.js ${NODE_MAJOR}.x…"
 
-    apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg >/dev/null
+    apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg >/dev/null </dev/null
 
     mkdir -p /etc/apt/keyrings
-    curl -fsSL "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" \
-        | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+    local ns_key
+    ns_key="$(mktemp)"
+    if fetch_with_retry "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" "$ns_key"; then
+        gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg <"$ns_key"
+    else
+        rm -f "$ns_key"
+        warn "Не удалось скачать ключ NodeSource — репозиторий Node.js не подключён"
+        return
+    fi
+    rm -f "$ns_key"
     chmod a+r /etc/apt/keyrings/nodesource.gpg
 
     local codename="$OS_CODENAME"
@@ -636,22 +1022,28 @@ install_packages() {
     # Базовое
     local -a base=(
         curl ca-certificates gnupg apt-transport-https
-        software-properties-common git unzip zip tar xz-utils bzip2
+        # software-properties-common на Debian 13 удалён из репозиториев, и он
+        # нам не нужен: enable_apt_components правит sources-файлы напрямую.
+        # Поэтому в обязательный список он не входит, а общий фильтр ниже
+        # отбросит его молча, если пакет всё же недоступен.
+        git unzip zip tar xz-utils bzip2
         jq less vim htop wget
         ufw fail2ban
+        # sudo — документированный способ запуска; adduser — создание
+        # системного пользователя gamedock. На минимальных образах их нет.
+        sudo adduser
     )
 
-    # PHP версионными пакетами: так единообразно для всех дистрибутивов
-    local php_ver="${PHP_VERSION/./}"   # 8.3 -> 83
-    base+=(
-        "php${php_ver}-fpm" "php${php_ver}-cli" "php${php_ver}-mysql"
-        "php${php_ver}-mbstring" "php${php_ver}-xml" "php${php_ver}-curl"
-        "php${php_ver}-zip" "php${php_ver}-gd" "php${php_ver}-bcmath"
-        "php${php_ver}-intl" "php${php_ver}-opcache"
-    )
-
-    # php-soap нужен платёжным шлюзам, но есть не везде — добавляем опционально
-    base+=("php${php_ver}-soap" "php${php_ver}-redis")
+    # PHP версионными пакетами: так единообразно для всех дистрибутивов.
+    #
+    # Имя пакета в дистрибутивах и у packages.sury.org — С ТОЧКОЙ:
+    # php8.3-fpm, php8.3-cli. Без точки (php83-fpm) таких пакетов нет.
+    # Раньше здесь была подстановка ${PHP_VERSION/./}, из-за чего все
+    # PHP-пакеты молча уходили в «не найдены» и установка падала позже.
+    local ext
+    for ext in fpm cli mysql mbstring xml curl zip gd bcmath intl opcache soap redis; do
+        base+=("$(php_pkg "$ext")")
+    done
 
     # База данных и Redis
     if [[ $INSTALL_DB == "mysql" ]]; then
@@ -669,16 +1061,28 @@ install_packages() {
     base+=(
         build-essential cmake pkg-config
         libssl-dev libcurl4-openssl-dev libicu-dev
-        libsdl2-dev libncursesw5-dev
+        libsdl2-dev
         screen tmux cron
     )
 
-    # Java: 17 есть везде, 21 — не на всех дистрибутивах
-    base+=(openjdk-17-jre-headless)
-    if pkg_available "openjdk-21-jre-headless"; then
-        base+=(openjdk-21-jre-headless)
+    # ncurses: на Debian 13 пакет называется libncurses-dev, раньше был
+    # libncursesw5-dev. Нужен для нативной сборки CRMP/RAGEMP/MTA.
+    if pkg_available libncursesw5-dev; then
+        base+=(libncursesw5-dev)
+    elif pkg_available libncurses-dev; then
+        base+=(libncurses-dev)
     else
-        warn "openjdk-21-jre-headless недоступен в $OS_PRETTY_NAME — ставится только Java 17"
+        warn "Заголовки ncurses недоступны — нативная сборка CRMP/RAGEMP может не собраться"
+    fi
+
+    # Java: версию определяем по тому, что реально ставится. На Debian 13
+    # OpenJDK 17 удалён, на Debian 11/12 может не быть 21.
+    local java_pkg
+    if java_pkg="$(java_package)"; then
+        base+=("$java_pkg")
+        log "  Java: $java_pkg"
+    else
+        warn "Ни одна версия OpenJDK не найдена — поставлю вручную (нужна для Minecraft и CS2)"
     fi
 
     # SteamCMD — для CS2, Rust, Unturned, ARK
@@ -686,7 +1090,15 @@ install_packages() {
         if pkg_available steamcmd; then
             base+=(steamcmd)
         else
-            warn "Пакет steamcmd недоступен — поставьте его вручную или установите игры в контейнерах"
+            # На Debian 13 пакет удалён из репозиториев. Установку не роняем:
+            # игры на Steam либо ставятся в контейнерах, либо SteamCMD
+            # доустанавливается вручную.
+            warn "Пакет steamcmd недоступен в репозиториях $OS_PRETTY_NAME"
+            warn "  Он нужен для CS2, Rust, Unturned и ARK. Варианты:"
+            warn "    • запускать эти игры в контейнерах (рантайм docker) — рекомендуется"
+            warn "    • поставить SteamCMD вручную: mkdir -p /usr/games/steamcmd && \\"
+            warn "      curl -sL https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \\"
+            warn "      | tar -xz -C /usr/games/steamcmd"
         fi
     fi
 
@@ -716,7 +1128,15 @@ install_packages() {
 
     log "Устанавливаю ${#available[@]} пакетов (это займёт несколько минут)…"
 
-    if ! apt-get install -y -qq "${available[@]}" 2>&1 | tee -a "$LOG_FILE" | tail -5; then
+    # force-confdef/confold: при обновлении конфигурационных файлов dpkg по
+    # умолчанию показывает вопрос с выбором. Здесь берём версию из пакета и
+    # не спрашиваем — иначе установка встанет и будет ждать Enter.
+    # apt_quiet_flags подставляется как отдельные слова, поэтому массив
+    # строится, а не пишется строкой.
+    local -a apt_flags=()
+    read -r -a apt_flags <<<"$(apt_quiet_flags)"
+
+    if ! run_logged 5 apt-get install "${apt_flags[@]}" -qq "${available[@]}"; then
         fail "apt-get install не удался. Подробности: $LOG_FILE"
     fi
 
@@ -725,41 +1145,142 @@ install_packages() {
     ok "Пакеты установлены"
 }
 
-# Composer нужен для panel/composer.json, но в дистрибутивах его нет.
+# Скачать файл с повторами.
+#
+# getcomposer.org из части сетей отдаёт «SSL: Handshake timed out», и одной
+# попытки мало: внешний хост периодически не отвечает. curl сам повторяет
+# дважды, плюс мы делаем три попытки с растущей паузой.
+fetch_with_retry() {
+    local url="$1" out="$2" attempt
+
+    for attempt in 1 2 3; do
+        if curl -fsSL \
+            --connect-timeout 15 \
+            --max-time 180 \
+            --retry 2 \
+            --retry-delay 3 \
+            --retry-connrefused \
+            "$url" -o "$out"; then
+            return 0
+        fi
+
+        [[ $attempt -lt 3 ]] || break
+        warn "  попытка ${attempt}/3 не удалась, повторяю…"
+        sleep $((attempt * 3))
+    done
+
+    return 1
+}
+
+# Composer нужен для panel/composer.json.
+#
+# Порядок именно такой — сначала пакет из репозитория дистрибутива, и только
+# потом официальный установщик с getcomposer.org. На это две причины:
+#
+#   1. composer есть в main во всех пяти поддерживаемых системах
+#      (Debian 11/12/13, Ubuntu 22.04/24.04), и версия оттуда подходит:
+#      панели нужен PHP ^8.2 и Laravel 11, то есть composer-runtime-api ^2.2;
+#   2. getcomposer.org в сетях с фильтрами отдаёт мусор вместо phar —
+#      установщик молча падает с «Failed to decode zlib stream». Проверять
+#      подпись полезно только тогда, когда сам файл доехал целым.
+#
+# Раньше было наоборот, плюс `php installer` вызывался без проверки кода
+# возврата — при ошибке `set -e` обрывал установку молча.
+install_composer_from_distro() {
+    pkg_available composer || return 1
+
+    local -a apt_flags=()
+    read -r -a apt_flags <<<"$(apt_quiet_flags)"
+    run_logged 3 apt-get install "${apt_flags[@]}" -qq composer || return 1
+    command -v composer >/dev/null 2>&1
+}
+
+install_composer_from_official() {
+    local installer=/tmp/composer-setup.php
+    local sigfile=/tmp/composer-setup.sig
+    local expected actual
+
+    fetch_with_retry "https://getcomposer.org/installer" "$installer" || {
+        warn "getcomposer.org недоступен"
+        return 1
+    }
+
+    fetch_with_retry "https://composer.github.io/installer.sig" "$sigfile" || {
+        warn "Не удалось получить подпись установщика Composer"
+        rm -f "$installer"
+        return 1
+    }
+
+    expected="$(tr -d ' \t\r\n' <"$sigfile")"
+
+    if command -v sha384sum >/dev/null 2>&1; then
+        actual="$(sha384sum "$installer" | cut -d' ' -f1)"
+    else
+        warn "sha384sum недоступен — считаю подпись через PHP"
+        actual="$(php -r 'echo hash_file("sha384", $argv[1]);' "$installer" 2>/dev/null || true)"
+    fi
+
+    if [[ -z $expected ]]; then
+        warn "Пустая подпись — не доверяю установщику и пропускаю"
+        rm -f "$installer" "$sigfile"
+        return 1
+    fi
+
+    if [[ $actual != "$expected" ]]; then
+        warn "Подпись установщика не совпала — не доверяю и пропускаю"
+        rm -f "$installer" "$sigfile"
+        return 1
+    fi
+
+    # Проверяем код возврата: при ошибке загрузки phar установщик возвращает
+    # ненулевой код, и без проверки set -e оборвал бы скрипт без объяснений.
+    if ! php "$installer" --quiet --install-dir=/usr/local/bin --filename=composer; then
+        warn "Официальный установщик не отработал — скорее всего, phar пришёл битым"
+        warn "  (прокси или фильтр вместо архива отдают HTML, и PHP пишет"
+        warn "   «Failed to decode zlib stream»)"
+        rm -f "$installer" "$sigfile"
+        return 1
+    fi
+
+    rm -f "$installer" "$sigfile"
+    command -v composer >/dev/null 2>&1
+}
+
 install_composer() {
     if command -v composer >/dev/null 2>&1; then
         ok "Composer уже установлен: $(composer --version 2>/dev/null | head -1)"
-        return
+        return 0
     fi
 
     log "Устанавливаю Composer…"
 
-    local installer="/tmp/composer-setup.php"
-    curl -fsSL https://getcomposer.org/installer -o "$installer"
-
-    # Ожидаемаю подпись — защита от подмены скрипта.
-    local expected
-    expected="$(curl -fsSL https://composer.github.io/installer.sig)"
-
-    if command -v sha384sum >/dev/null 2>&1; then
-        local actual
-        actual="$(sha384sum "$installer" | cut -d' ' -f1)"
-        [[ $actual == "$expected" ]] || { rm -f "$installer"; fail "Подпись установщика Composer не совпала"; }
-    else
-        warn "sha384sum недоступен — проверяю подпись через PHP"
-        php -r '
-            $h = hash_file("sha384", $argv[1]);
-            $e = trim(file_get_contents($argv[2]));
-            exit($h === $e ? 0 : 1);
-        ' "$installer" <(curl -fsSL https://composer.github.io/installer.sig) \
-            || { rm -f "$installer"; fail "Подпись установщика Composer не совпала"; }
+    if install_composer_from_distro; then
+        ok "Composer установлен из репозитория: $(composer --version 2>/dev/null | head -1)"
+        return 0
     fi
 
-    php "$installer" --quiet --install-dir=/usr/local/bin --filename=composer
-    rm -f "$installer"
+    warn "Composer из репозитория не поставился, пробую официальный установщик"
+    if install_composer_from_official; then
+        ok "Composer установлен: $(composer --version 2>/dev/null | head -1)"
+        return 0
+    fi
 
-    command -v composer >/dev/null 2>&1 || fail "Composer не установился"
-    ok "Composer установлен: $(composer --version 2>/dev/null | head -1)"
+    fail "Composer не установился.
+
+Что делать (любой из вариантов), затем запустите установщик снова:
+
+  1) Из репозитория дистрибутива — самый надёжный путь:
+       apt-get update && apt-get install -y composer
+
+  2) Положить phar на место вручную. ВАЖНО: если в ответ приходит не
+     архив, а HTML-заглушка прокси, файл будет битым, и Composer не запустится.
+     Проверьте, что скачался именно phar:
+       curl -fsSL https://getcomposer.org/composer-stable.phar -o /usr/local/bin/composer
+       chmod +x /usr/local/bin/composer
+       php /usr/local/bin/composer --version
+
+  3) Если getcomposer.org отдаёт мусор — его режет фильтр или провайдер.
+     Скачайте phar на машине без фильтра и перенесите на сервер по scp."
 }
 
 create_service_user() {
@@ -785,31 +1306,133 @@ create_service_user() {
 # База данных и Redis
 # ═══════════════════════════════════════════════════════════════════
 
+# Клиент MariaDB: в Debian 13 это mariadb, но mysql тоже есть и привычнее.
+db_client() {
+    if command -v mariadb >/dev/null 2>&1; then
+        printf 'mariadb'
+    else
+        printf 'mysql'
+    fi
+}
+
+DB_ROOT_PASS_FILE=/root/.gamedock-db-root.txt
+DB_AUTH_MODE=""
+
+# Выполнить SQL от root, подбирая рабочий способ входа.
+#
+# Способы проверяются по порядку, и первый сработавший запоминается:
+#   1) unix_socket — так MariaDB на Debian настроена из коробки;
+#   2) пароль из сохранённого файла — если его ставил прошлый запуск;
+#   3) только что сгенерированный пароль.
+#
+# Раньше было так: установщик выполнял ALTER USER … IDENTIFIED BY, после
+# чего root начинал требовать пароль, а все следующие запросы шли БЕЗ него.
+# MariaDB отклонял их, и set -e ронял установку молча — кроме
+# предупреждения про пароль ничего не печаталось. А сам пароль нигде не
+# сохранялся, и вернуть доступ можно было только через skip-grant-tables.
+db_root() {
+    local sql="$1" c
+    c="$(db_client)"
+
+    if [[ -z $DB_AUTH_MODE ]]; then
+        if $c -u root -e "SELECT 1;" >/dev/null 2>&1; then
+            DB_AUTH_MODE=socket
+        elif [[ -f $DB_ROOT_PASS_FILE ]]; then
+            # shellcheck disable=SC1090
+            . "$DB_ROOT_PASS_FILE"
+            if [[ -n ${DB_ROOT_PASS:-} ]] &&
+               $c -u root -p"$DB_ROOT_PASS" -e "SELECT 1;" >/dev/null 2>&1; then
+                DB_AUTH_MODE=pass
+            fi
+        fi
+    fi
+
+    # Разделителя «--» здесь быть не должно: клиент mariadb его не понимает
+    # и молча уходит в ошибку. Проверка выше использует -e, значит и выполнение
+    # обязано использовать -e — иначе db_root_works проходит, а сам запрос
+    # возвращает код 1.
+    case "$DB_AUTH_MODE" in
+        socket) $c -u root -e "$sql" ;;
+        pass)   $c -u root -p"$DB_ROOT_PASS" -e "$sql" ;;
+        *)      return 1 ;;
+    esac
+}
+
+db_root_works() {
+    db_root "SELECT 1;" >/dev/null 2>&1
+}
+
 setup_database() {
     step "Настройка базы данных"
 
     if [[ $INSTALL_DB == "external" ]]; then
-        log "Использется внешняя БД — пропускаю установку"
+        log "Используется внешняя БД — пропускаю установку"
         return
+    fi
+
+    systemctl enable --now mariadb >/dev/null 2>&1 || systemctl enable --now mysql
+
+    # ── root-пароль ────────────────────────────────────────────
+    # Сохранённый переиспользуем: новый пароль при каждом запуске ломал бы
+    # и существующие подключения, и сам доступ.
+    if [[ -z ${DB_ROOT_PASS:-} && -f $DB_ROOT_PASS_FILE ]]; then
+        # shellcheck disable=SC1090
+        . "$DB_ROOT_PASS_FILE"
+    fi
+
+    if ! db_root_works; then
+        if [[ -z ${DB_ROOT_PASS:-} ]]; then
+            DB_ROOT_PASS="$(gen_password 28)"
+        fi
+
+        if db_root "ALTER USER 'root'@'localhost' IDENTIFIED BY '${DB_ROOT_PASS}';"; then
+            DB_AUTH_MODE=pass
+            umask 077
+            {
+                printf '# root от MariaDB. Установщик GameDock.\n'
+                printf '# Нужен для обслуживания и для входа в phpMyAdmin от root.\n'
+                printf '# Права 600, владелец root.\n'
+                printf 'DB_ROOT_PASS=%q\n' "$DB_ROOT_PASS"
+            } >"$DB_ROOT_PASS_FILE"
+            ok "Пароль root от базы задан и сохранён: $DB_ROOT_PASS_FILE"
+        else
+            fail "Нет доступа к MySQL от root, и пароль установить не удалось.
+
+У MariaDB на Debian учётка root ходит через unix_socket, а не по паролю. Если
+пароль уже был установлен прошлым запуском и потерян, вернуть доступ можно
+только вручную:
+
+  systemctl stop mariadb
+  systemctl start mariadb --skip-grant-tables --skip-networking
+  mysql -e \"FLUSH PRIVILEGES; ALTER USER 'root'@'localhost' IDENTIFIED BY 'НОВЫЙ_ПАРОЛЬ';\"
+  systemctl restart mariadb
+
+После этого запустите установку снова: пароль сохранится в
+$DB_ROOT_PASS_FILE, и вход будет работать."
+        fi
+    else
+        ok "Доступ к MySQL от root есть (${DB_AUTH_MODE:-pass})"
     fi
 
     DB_PASS="$(gen_password 28)"
 
-    systemctl enable --now mariadb >/dev/null 2>&1 || systemctl enable --now mysql
+    db_root "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" ||
+        fail "Не удалось создать базу $DB_NAME"
 
-    # root-пароль для MariaDB
-    if [[ -z $DB_ROOT_PASS ]]; then
-        DB_ROOT_PASS="$(gen_password 28)"
-    fi
+    # CREATE USER IF NOT EXISTS при уже существующем пользователе молча
+    # ничего не делает — пароль остаётся прежним. А .env ниже получает
+    # свежесгенерированный DB_PASS, и на повторном запуске установщика они
+    # расходятся: миграции падают с «Access denied for user gamedock@localhost».
+    # Поэтому создаём, а затем ALTER USER — он всегда приводит пароль в
+    # соответствие с .env.
+    db_root "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';" ||
+        fail "Не удалось создать пользователя $DB_USER"
+    db_root "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';" ||
+        fail "Не удалось задать пароль пользователю $DB_USER"
 
-    mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${DB_ROOT_PASS}';" 2>/dev/null \
-        || mysql -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${DB_ROOT_PASS}');" 2>/dev/null \
-        || warn "Не удалось установить пароль root (возможно, уже настроен)"
-
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-    mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
-    mysql -e "FLUSH PRIVILEGES;"
+    db_root "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';" ||
+        fail "Не удалось выдать права пользователю $DB_USER"
+    db_root "FLUSH PRIVILEGES;"
 
     ok "База ${DB_NAME} создана, пользователь ${DB_USER}"
 }
@@ -949,14 +1572,22 @@ verify_php_installed() {
         PHP_VERSION="$fallback"
     fi
 
-    [[ -n $PHP_VERSION ]] || fail "PHP не найден. Установите вручную: apt install php${MIN_PHP_MAJOR}${MIN_PHP_MINOR}-fpm"
+    [[ -n $PHP_VERSION ]] || fail "PHP не найден. Установите вручную: apt install php${MIN_PHP_MAJOR}.${MIN_PHP_MINOR}-fpm"
 
     if ! version_ge "$PHP_VERSION" "${MIN_PHP_MAJOR}.${MIN_PHP_MINOR}"; then
         fail "Нужен PHP >= ${MIN_PHP_MAJOR}.${MIN_PHP_MINOR}, а установлен ${PHP_VERSION} (Laravel 11 не запустится)"
     fi
 
-    # Расширения, без которых панель не поднимется
-    local -a required=(cli fpm mbstring xml curl zip gd bcmath intl mysql opcache)
+    # Расширения, без которых панель не поднимется.
+    #
+    # Список прежде содержал cli, fpm, mysql и opcache, и это были ложные
+    # срабатывания: cli и fpm — не расширения, а SAPI, расширения с таким
+    # именем не существует; mysql удалён из PHP начиная с 7.0 (нужен
+    # pdo_mysql); opcache для SAPI cli штатно выключен. Панель сообщала
+    # «PHP без расширений: cli fpm mysql opcache», а следующей строкой —
+    # «все нужные расширения на месте».
+    local -a required=(mbstring xml curl zip gd bcmath intl pdo_mysql \
+                       fileinfo tokenizer ctype openssl exif)
     local -a missing=()
     local ext
 
@@ -968,37 +1599,119 @@ verify_php_installed() {
 
     if (( ${#missing[@]} > 0 )); then
         warn "PHP ${PHP_VERSION} без расширений: ${missing[*]}"
-        warn "Установите их и повторите настройку"
+        warn "Установите их и повторите настройку:"
+        for ext in "${missing[@]}"; do
+            printf '     apt-get install -y php%s-%s\n' "$PHP_VERSION" "$ext" | sed 's/^/  /'
+        done
+        fail "Панель без этих расширений не запустится. Установите их и прогоните установку снова."
     fi
 
     ok "PHP ${PHP_VERSION} найден, все нужные расширения на месте"
 }
 
-setup_panel() {
-    step "Развёртываю панель"
+
+# Создаёт служебные каталоги Laravel. В репозитории их нет — только
+# .gitignore, — и composer install падает на post-autoload-dump, требуя
+# bootstrap/cache. Права выдаём пользователю панели: composer и artisan
+# пишут туда от его имени.
+prepare_panel_dirs() {
+    local d
+    for d in \
+        "$PANEL_DIR/bootstrap/cache" \
+        "$PANEL_DIR/storage/app/public" \
+        "$PANEL_DIR/storage/framework/cache/data" \
+        "$PANEL_DIR/storage/framework/sessions" \
+        "$PANEL_DIR/storage/framework/testing" \
+        "$PANEL_DIR/storage/framework/views" \
+        "$PANEL_DIR/storage/logs" \
+        "$PANEL_DIR/public/build"
+    do
+        mkdir -p "$d" || warn "Не удалось создать $d"
+    done
+
+    chown -R "$SERVICE_USER:$SERVICE_USER" \
+        "$PANEL_DIR/bootstrap/cache" \
+        "$PANEL_DIR/storage" \
+        "$PANEL_DIR/public/build" 2>/dev/null || true
+
+    chmod -R ug+rwx "$PANEL_DIR/bootstrap/cache" "$PANEL_DIR/storage" 2>/dev/null || true
+
+    ok "Служебные каталоги Laravel созданы"
+}
+
+# Копирует исходники панели и создаёт служебные каталоги.
+# Отделён от install_panel_deps, чтобы .env успевал появиться между ними.
+deploy_panel_sources() {
+    step "Разворачиваю панель"
+
 
     mkdir -p "$PANEL_DIR"
-    cp -a "$REPO_DIR/panel/." "$PANEL_DIR/"
+    copy_tree "$REPO_DIR/panel" "$PANEL_DIR" "панель" \
+        || fail "Не удалось развернуть панель из $REPO_DIR/panel"
     chown -R "$SERVICE_USER:$SERVICE_USER" "$PANEL_DIR"
 
+    # Каталоги, которые Laravel создаёт сам при развёртывании, а в
+    # репозитории их нет — только .gitignore. Без них composer install
+    # падает на post-autoload-dump: «The bootstrap/cache directory must be
+    # present and writable».
+    prepare_panel_dirs
+
     cd "$PANEL_DIR"
+
+
+    ok "Исходники панели на месте"
+}
+
+# Ставит зависимости PHP и JS. Запускается ПОСЛЕ setup_env:
+# composer install вызывает artisan package:discover, который загружает
+# приложение и читает .env — без корректного .env он падает ещё здесь.
+install_panel_deps() {
+    step "Ставлю зависимости панели"
 
     log "Ставлю зависимости Composer…"
     su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && composer install --no-dev --optimize-autoloader --no-interaction" 2>&1 | tail -8
 
-    [[ -f vendor/autoload.php ]] || fail "composer install не удался"
+    if [[ ! -f vendor/autoload.php ]]; then
+        fail "composer install не удался. Проверьте, что панели доступен интернет
+для загрузки пакетов с repo.packagist.org и github.com, и что пользователю
+$SERVICE_USER хватает прав на запись в $PANEL_DIR."
+    fi
 
     # Фронтенд
+    #
+    # npm ci требует package-lock.json и без него просто падает — панель
+    # остаётся без стилей и скриптов. Поэтому при наличии lock-файла
+    # используем ci (воспроизводимая установка), а без него install.
     log "Собираю фронтенд…"
-    su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && npm ci --silent && npm run build" 2>&1 | tail -5 \
-        || warn "Сборка фронтенда не удалась — интерфейс будет без ассетов"
+    local npm_install="npm install"
+    if [[ -f "$PANEL_DIR/package-lock.json" ]]; then
+        npm_install="npm ci"
+    else
+        warn "package-lock.json нет — ставлю через npm install вместо npm ci"
+    fi
+
+    if su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && $npm_install --silent --no-audit --no-fund" 2>&1 | tail -5; then
+        su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && npm run build" 2>&1 | tail -5 \
+            || warn "Сборка ассетов не удалась — интерфейс будет без стилей"
+    else
+        warn "Установка зависимостей фронтенда не удалась — интерфейс будет без стилей"
+    fi
 
     # Каталоги
-    su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && php artisan storage:link" 2>/dev/null || true
+    # storage:link падает с «The [public/storage] link already exists» при
+    # повторном запуске, когда symlink уже создан. Линк в suchom случае
+    # просто пересоздаём, а не считаем ошибкой.
+    if [[ -L "$PANEL_DIR/public/storage" || -e "$PANEL_DIR/public/storage" ]]; then
+        rm -f "$PANEL_DIR/public/storage"
+    fi
+    su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && php artisan storage:link" 2>&1 | tail -2 \
+        || warn "Не удалось создать ссылку public/storage — загруженные файлы будут недоступны"
     chown -R "$SERVICE_USER:$SERVICE_USER" storage bootstrap/cache
     chmod -R ug+rwx storage bootstrap/cache
 
     ok "Панель развёрнута в $PANEL_DIR"
+
+    ok "Зависимости панели установлены"
 }
 
 setup_env() {
@@ -1009,13 +1722,18 @@ setup_env() {
     local app_key
     app_key="base64:$(openssl rand -base64 32)"
 
-    # Настройки из диалога
+    # Настройки из диалога.
+    #
+    # Всё, что пришло от пользователя, пишем в кавычках. Без них любое
+    # значение с пробелом ломает разбор .env: Laravel падает с «Failed to
+    # parse dotenv file. Encountered unexpected whitespace at […]», и это
+    # происходит уже на composer install, до миграций.
     cat >.env <<ENVEOF
-APP_NAME=${PANEL_NAME}
+APP_NAME="${PANEL_NAME}"
 APP_ENV=production
 APP_KEY=${app_key}
 APP_DEBUG=false
-APP_URL=https://${PANEL_DOMAIN}
+APP_URL="https://${PANEL_DOMAIN}"
 APP_TIMEZONE=Europe/Moscow
 APP_LOCALE=ru
 APP_FALLBACK_LOCALE=en
@@ -1046,7 +1764,7 @@ BROADCAST_CONNECTION=log
 FILESYSTEM_DISK=local
 
 MAIL_MAILER=log
-MAIL_FROM_ADDRESS=noreply@${PANEL_DOMAIN}
+MAIL_FROM_ADDRESS="noreply@${PANEL_DOMAIN}"
 MAIL_FROM_NAME="${PANEL_NAME}"
 
 # Режимы работы
@@ -1055,24 +1773,24 @@ GD_RUNTIME=${DEFAULT_RUNTIME}
 GD_DOCKER_SOCKET=/var/run/docker.sock
 GD_SERVERS_ROOT=/home/gamedock/servers
 GD_BACKUPS_ROOT=/home/gamedock/backups
-GD_SYSTEM_USER=${SERVICE_USER}
-GD_SYSTEM_GROUP=${SERVICE_GROUP}
+GD_SYSTEM_USER="${SERVICE_USER}"
+GD_SYSTEM_GROUP="${SERVICE_GROUP}"
 GD_AGENT_INBOUND=true
 
-GD_TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-GD_TELEGRAM_ADMIN_CHAT_ID=${TELEGRAM_ADMIN_CHAT}
+GD_TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
+GD_TELEGRAM_ADMIN_CHAT_ID="${TELEGRAM_ADMIN_CHAT}"
 
 GD_PAYMENTS_ENABLED=true
-GD_YOOKASSA_SHOP_ID=${YOOKASSA_SHOP_ID}
-GD_YOOKASSA_SECRET_KEY=${YOOKASSA_SECRET}
-GD_TINKOFF_TERMINAL_KEY=${TINKOFF_TERMINAL}
-GD_TINKOFF_PASSWORD=${TINKOFF_PASSWORD}
-GD_CRYPTOBOT_TOKEN=${CRYPTOBOT_TOKEN}
-GD_PAYMENT_SUCCESS_URL=https://${PANEL_DOMAIN}/payment/success
-GD_PAYMENT_CANCEL_URL=https://${PANEL_DOMAIN}/payment/cancel
+GD_YOOKASSA_SHOP_ID="${YOOKASSA_SHOP_ID}"
+GD_YOOKASSA_SECRET_KEY="${YOOKASSA_SECRET}"
+GD_TINKOFF_TERMINAL_KEY="${TINKOFF_TERMINAL}"
+GD_TINKOFF_PASSWORD="${TINKOFF_PASSWORD}"
+GD_CRYPTOBOT_TOKEN="${CRYPTOBOT_TOKEN}"
+GD_PAYMENT_SUCCESS_URL="https://${PANEL_DOMAIN}/payment/success"
+GD_PAYMENT_CANCEL_URL="https://${PANEL_DOMAIN}/payment/cancel"
 
-GD_BRAND_NAME=${PANEL_NAME}
-GD_SUPPORT_EMAIL=${SUPPORT_EMAIL}
+GD_BRAND_NAME="${PANEL_NAME}"
+GD_SUPPORT_EMAIL="${SUPPORT_EMAIL}"
 ENVEOF
 
     chown "$SERVICE_USER:$SERVICE_USER" .env
@@ -1176,6 +1894,272 @@ PHPEOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+# phpMyAdmin
+# ═══════════════════════════════════════════════════════════════════
+
+# Приводит путь к виду /phpmyadmin — без слэшей по краям и с ведущим.
+# Пустой или «/» запрещаем: это означало бы, что phpMyAdmin отдаётся на весь
+# сайт и перехватывает панель.
+normalize_pma_path() {
+    local p="$1"
+    p="${p// /}"
+    p="${p#/}"
+    p="${p%/}"
+
+    [[ -n $p ]] || p="phpmyadmin"
+    [[ $p =~ ^[A-Za-z0-9._/-]+$ ]] || p="phpmyadmin"
+
+    # Отсекаем пути, которые nginx всё равно не отдаст на phpMyAdmin
+    case "$p" in
+        phpmyadmin|assets|storage|panel|api|login|logout) p="phpmyadmin" ;;
+    esac
+
+    printf '/%s' "$p"
+}
+
+# Учётная запись для входа в phpMyAdmin.
+#
+# Это не база данных: отдельная пара «логин-пароль» в htpasswd, чтобы
+# интерфейс нельзя было достать перебором по самой базе. Пароль генерируется
+# один раз и хранится в файле с правами 600 — при повторном запуске
+# установщика не меняется, иначе ссылка из итогового отчёта перестала бы
+# работать.
+phpmyadmin_credentials() {
+    local user="$1" pass hash
+
+    if [[ -f $PHPMYADMIN_CREDS ]]; then
+        # shellcheck disable=SC1090
+        . "$PHPMYADMIN_CREDS"
+        user="${PMA_USER:-$user}"
+        pass="${PMA_PASS:-}"
+    fi
+
+    if [[ -z $pass ]]; then
+        # hex — чтобы не вышло кавычек или служебных символов, которые
+        # сломали бы htpasswd и сам пароль
+        pass="$(openssl rand -hex 12)"
+        umask 077
+        {
+            printf '# Учётная запись для входа в phpMyAdmin. Не удаляйте,\n'
+            printf '# пока хотите вход под тем же паролем.\n'
+            printf 'PMA_USER=%q\n' "$user"
+            printf 'PMA_PASS=%q\n' "$pass"
+        } >"$PHPMYADMIN_CREDS"
+        chmod 600 "$PHPMYADMIN_CREDS"
+    fi
+
+    # nginx понимает crypt(3), а htpasswd из apache2-utils в системе может
+    # не быть — поэтому хэш делаем openssl
+    hash="$(openssl passwd -6 "$pass" 2>/dev/null)" || return 1
+
+    umask 077
+    printf '%s:%s\n' "$user" "$hash" >"$PHPMYADMIN_HTPASSWD"
+    chmod 640 "$PHPMYADMIN_HTPASSWD"
+    chown root:www-data "$PHPMYADMIN_HTPASSWD" 2>/dev/null || true
+
+    printf '%s\n%s\n' "$user" "$pass"
+}
+
+# Пишет конфиг nginx для phpMyAdmin.
+#
+# Отдельным файлом, а не в основной vhost: так его можно перегенерировать
+# независимо и не трогать большой heredoc панели.
+# Какой сокет PHP-FPM использовать.
+#
+# Пул gamedock кладёт сокет в /run/php/gamedock-fpm.sock. Если его ещё нет
+# (например, php-fpm не перезапускался), берём сокет версии из дистрибутива.
+# Значение нужно и vhost'у панели, и сниппету phpMyAdmin, поэтому оно
+# глобальное, а не локальная переменная внутри setup_nginx.
+resolve_fpm_socket() {
+    local name="gamedock-fpm.sock"
+    [[ -S "/run/php/$name" ]] || name="php${PHP_VERSION}-fpm.sock"
+    printf '%s' "$name"
+}
+
+phpmyadmin_snippet() {
+    local path="$1"
+    local -a rules=()
+    local ip entry
+    local socket
+    socket="$(resolve_fpm_socket)"
+
+    # allow/deny вставляем внутрь location. Список IP не задан — доступ
+    # открыт всем, но по паролю; это осознанный выбор, а не недосмотр.
+    if [[ -n $PHPMYADMIN_ALLOW ]]; then
+        IFS=',' read -ra parts <<<"$PHPMYADMIN_ALLOW"
+        for ip in "${parts[@]}"; do
+            entry="$(printf '%s' "$ip" | tr -d '[:space:]')"
+            [[ -n $entry ]] || continue
+            rules+=("    allow ${entry};")
+        done
+        rules+=("    deny all;")
+    else
+        rules+=("    # Список IP не задан: вход открыт с любого адреса,")
+        rules+=("    # но защищён паролем nginx (htpasswd).")
+    fi
+
+    mkdir -p "$(dirname "$PHPMYADMIN_SNIPPET")"
+
+    # Heredoc без кавычек — подставляются переменные. Все доллары nginx
+    # экранированы как \$, иначе bash попытается их разобрать.
+    cat >"$PHPMYADMIN_SNIPPET" <<PMAEOF
+# phpMyAdmin — веб-интерфейс к базам MySQL/MariaDB.
+# Создаётся установщиком GameDock, правьте через --pma-* при установке.
+# Подключается из vhost панели строкой
+#   include $PHPMYADMIN_SNIPPET;
+
+# Без завершающего слэша браузер не поймёт, куда смотреть
+location = ${path} {
+    return 301 ${path}/;
+}
+
+# Префикс ^~: без него запросы к phpMyAdmin перехватил бы общий
+# «location ~ \.php\$ { return 404; }» ниже в конфиге панели.
+location ^~ ${path}/ {
+    # root, а не alias: тогда \$fastcgi_script_name сам даёт путь
+    # /usr/share/phpmyadmin/… и SCRIPT_FILENAME собирается без
+    # хрупкой подстановки вручную.
+    root /usr/share;
+    index index.php;
+
+    location ~ \.php\$ {
+        include fastcgi_params;
+        # Прямо в сокет, а не через upstream gamedock_php: имя upstream живёт
+        # в vhost панели, и сниппет перестал бы работать в любом другом
+        # месте — в том числе в тестовом стенде.
+        fastcgi_pass unix:/run/php/${socket};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT /usr/share/phpmyadmin;
+
+        # phpMyAdmin не должен видеть файлы панели и служебные файлы
+        # системы. Но /usr/share/php обязателен: Debian-пакет выносит
+        # туда общие библиотеки (Composer/CaBundle, PhpMyAdmin/SqlParser,
+        # FastRoute и другие) и подключает их из autoload.php. Без этого
+        # пути phpMyAdmin падает с 500: «open_basedir restriction in
+        # effect. File(/usr/share/php/Composer/CaBundle/autoload.php)».
+        # /etc/ssl/certs нужен для подключения к базе по TLS,
+        # каталог сессий — чтобы phpMyAdmin смог сохранять настройки.
+        fastcgi_param PHP_ADMIN_VALUE "open_basedir=/usr/share/phpmyadmin:/usr/share/php:/etc/phpmyadmin:/var/lib/phpmyadmin:/etc/ssl/certs:/var/lib/php/sessions:/var/www/certbot:/tmp";
+        fastcgi_read_timeout 300;
+    }
+
+    # Точечные файлы и служебные каталоги наружу не отдаём
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+    # Вход закрыт паролем nginx — это отдельная учётка, не база данных
+    auth_basic "GameDock — phpMyAdmin";
+    auth_basic_user_file $PHPMYADMIN_HTPASSWD;
+
+$(printf '%s\n' "${rules[@]}")
+
+    access_log /var/log/nginx/phpmyadmin-access.log;
+    error_log  /var/log/nginx/phpmyadmin-error.log;
+}
+PMAEOF
+
+    # Единственная настоящая ссылка, по которой phpMyAdmin доступен.
+    # Ещё раз: без auth_basic ниже интерфейс был бы открыт всему интернету.
+    chmod 644 "$PHPMYADMIN_SNIPPET"
+}
+
+# Заглушка, чтобы include в vhost никогда не ломал nginx.
+phpmyadmin_snippet_stub() {
+    mkdir -p "$(dirname "$PHPMYADMIN_SNIPPET")"
+    cat >"$PHPMYADMIN_SNIPPET" <<'STUBEOF'
+# phpMyAdmin отключён при установке (--no-phpmyadmin).
+# Файл создан, чтобы include в конфиге панели оставался рабочим.
+STUBEOF
+}
+
+install_phpmyadmin() {
+    local requested="$PHPMYADMIN_PATH"
+    local path
+    path="$(normalize_pma_path "$requested")"
+
+    # normalize_pma_path вызывается в подстановке, поэтому предупредить
+    # внутри неё нельзя — весь вывод функции стал бы значением $path.
+    # Сообщаем здесь, если путь пришлось заменить.
+    if [[ $path != "/${requested#/}" ]]; then
+        warn "Путь phpMyAdmin «${requested}» занят или некорректен — публикую по $path"
+    fi
+
+    if [[ $WITH_PHPMYADMIN != "yes" ]]; then
+        log "phpMyAdmin пропущен (--no-phpmyadmin)"
+        phpmyadmin_snippet_stub
+        return 0
+    fi
+
+    if [[ $WITH_NGINX != "yes" ]]; then
+        warn "phpMyAdmin публикуется через nginx, а он отключён — пропускаю"
+        phpmyadmin_snippet_stub
+        return 0
+    fi
+
+    step "Ставлю phpMyAdmin"
+
+    if ! pkg_available phpmyadmin; then
+        warn "Пакет phpmyadmin недоступен в $OS_PRETTY_NAME — пропускаю"
+        phpmyadmin_snippet_stub
+        return 0
+    fi
+
+    # ── Preseed ───────────────────────────────────────────────
+    # У пакета ровно один вопрос: phpmyadmin/reconfigure-webserver,
+    # multiselect с вариантами apache2 и lighttpd. nginx среди них
+    # нет, поэтому не выбираем ничего — конфиг для веб-сервера мы всё
+    # равно пишем свой. Проверено на Debian 13: с этой строкой
+    # установка идёт без единого вопроса.
+    debconf-set-selections <<'PMACONF' 2>/dev/null || true
+phpmyadmin phpmyadmin/reconfigure-webserver multiselect
+PMACONF
+
+    # --no-install-recommends здесь обязателен, а не аккуратностью.
+    # В Recommends пакета стоит «libapache2-mod-php | lighttpd | nginx |
+    # php-fpm | httpd», и без этого флага apt ставит Apache, который
+    # занимает порт 80 и конфликтует с нашим nginx. Проверено:
+    # с флагом не ставится ничего лишнего, без него — Apache и PHP 8.5
+    # из Debian рядом с нашим 8.4 с packages.sury.org.
+    if ! run_logged 3 apt-get install -y -qq --no-install-recommends phpmyadmin; then
+        warn "Не удалось поставить phpMyAdmin — панель продолжит без него"
+        phpmyadmin_snippet_stub
+        return 0
+    fi
+
+    if [[ ! -f /usr/share/phpmyadmin/index.php ]]; then
+        warn "phpMyAdmin стоит, но /usr/share/phpmyadmin/index.php не найден — пропускаю"
+        phpmyadmin_snippet_stub
+        return 0
+    fi
+
+    # ── Права доступа к конфигу ───────────────────────────────
+    # Пул gamedock работает от пользователя gamedock, а файлы
+    # phpMyAdmin лежат с правами 0640 root:www-data. Без членства
+    # в www-data пул не прочитает ни базу настроек, ни ключ
+    # шифрования — и вход не заработает.
+    if ! id -nG "$SERVICE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx www-data; then
+        usermod -aG www-data "$SERVICE_USER" \
+            || warn "Не удалось добавить $SERVICE_USER в группу www-data"
+    fi
+
+    # ── Учётная запись и конфиг nginx ─────────────────────────
+    local creds
+    if ! creds="$(phpmyadmin_credentials "$PHPMYADMIN_USER")"; then
+        warn "Не удалось создать пароль для phpMyAdmin — интерфейс не публикую"
+        phpmyadmin_snippet_stub
+        return 0
+    fi
+
+    phpmyadmin_snippet "$path"
+
+    ok "phpMyAdmin: https://${PANEL_DOMAIN}${path}/"
+    PHPMYADMIN_URL="https://${PANEL_DOMAIN}${path}/"
+    # shellcheck disable=SC1090
+    . "$PHPMYADMIN_CREDS"
+}
+
+# ═══════════════════════════════════════════════════════════════════
 # nginx и SSL
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1187,13 +2171,99 @@ setup_nginx() {
 
     step "Настраиваю nginx"
 
-    local socket_name="gamedock-fpm.sock"
-    local php_ver="$PHP_VERSION"
-    [[ -S "/run/php/$socket_name" ]] || socket_name="php${php_ver}-fpm.sock"
+    # Тот же сокет, что и в сниппете phpMyAdmin — см. resolve_fpm_socket
+    local socket_name
+    socket_name="$(resolve_fpm_socket)"
 
-    cat >/etc/nginx/sites-available/gamedock <<'NGINXEOF'
+    # HTTPS-блоки создаём только при наличии настоящего сертификата.
+    #
+    # Проверки «WITH_SSL=yes, но сертификата ещё нет» тут недостаточно:
+    # nginx не стартует, если на «listen 443 ssl» не задан ssl_certificate,
+    # а старая заглушка комментировала только строку сертификата и оставляла
+    # сам listen. Из-за этого первый запуск с SSL всегда падал на nginx -t.
+    # Решение: пока сертификата нет — обслуживаем панель по HTTP, а после
+    # certbot вызываем setup_nginx ещё раз, и конфиг пересобирается с HTTPS.
+    local use_ssl="no"
+    if [[ $WITH_SSL == "yes" ]]; then
+        if [[ -f /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem ]]; then
+            use_ssl="yes"
+        else
+            warn "Сертификата ещё нет — сначала обслуживаем панель по HTTP"
+        fi
+    fi
+
+    # ── Набор location'ов панели ───────────────────────────────────
+    # Держим в переменной, потому что он нужен и в HTTP-блоке, и в HTTPS.
+    # Раньше он жил только в HTTPS-блоке, и при --no-ssl панель оказывалась
+    # недоступна: блок 80-го порта редиректил на https, которого не было.
+    local locations
+    locations="$(cat <<'LOCEOF'
+
+    client_max_body_size 128M;
+
+    # Ассеты
+    location /assets/ {
+        alias @@PANEL_DIR@@/public/build/;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # phpMyAdmin. Файл создаётся всегда — заглушкой, если он выключен,
+    # поэтому include не может сломать проверку конфигурации.
+    include @@PHPMYADMIN_SNIPPET@@;
+
+    location /storage/ {
+        alias @@PANEL_DIR@@/storage/app/public/;
+        expires 7d;
+    }
+
+    # SSE-поток консоли игрового сервера
+    location ~ ^/panel/servers/\d+/console/stream$ {
+        proxy_pass http://gamedock_php;
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding off;
+        gzip off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ ^/index\.php$ {
+        include fastcgi_params;
+        fastcgi_pass gamedock_php;
+        fastcgi_param SCRIPT_FILENAME @@PANEL_DIR@@/public/index.php;
+        fastcgi_param DOCUMENT_ROOT @@PANEL_DIR@@/public;
+        fastcgi_read_timeout 3600;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+    }
+
+    # Всё, что не index.php, исполнять нельзя: иначе .php из
+    # подкаталогов отдаётся как текст
+    location ~ \.php$ {
+        return 404;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+LOCEOF
+)"
+
+    # ── Общая часть: заголовок, map, upstream ───────────────────────
+    cat >/etc/nginx/sites-available/gamedock <<NGINXEOF
 # GameDock — панель управления
 # Агент: WSS на 9222 (см. ниже) — держим SSE без буферизации
+# Сгенерировано установщиком. Правьте через ключи --domain/--no-ssl.
 
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
@@ -1207,7 +2277,16 @@ upstream gamedock_php {
 
 # Лимит SSE-потока консоли: держим соединение подольше
 proxy_read_timeout 3600s;
-proxy_send_timeout 3600s;
+NGINXEOF
+
+    # ── Порт 80 ─────────────────────────────────────────────────────
+    # Условие именно use_ssl, а не WITH_SSL: пока сертификата нет, редирект
+    # на https увёл бы посетителя в никуда — блока 443 тогда ещё не создано,
+    # и панель была бы недоступна целиком. В этом состоянии обслуживаем
+    # панель прямо по HTTP.
+    if [[ $use_ssl == "yes" ]]; then
+        # Редирект на https. Само обслуживание панели живёт в блоке 443.
+        cat >>/etc/nginx/sites-available/gamedock <<NGINXEOF
 
 server {
     listen 80;
@@ -1218,14 +2297,39 @@ server {
     real_ip_header CF-Connecting-IP;
     real_ip_recursive on;
 
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
+NGINXEOF
+    else
+        # Сертификата нет и не будет: блок https создавать незачем, а
+        # редирект на него увёл бы посетителя в никуда. Отдаём панель
+        # прямо по HTTP.
+        warn "SSL выключен — панель работает по HTTP, https-блок не создаётся"
+        cat >>/etc/nginx/sites-available/gamedock <<NGINXEOF
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${PANEL_DOMAIN} ${PANEL_DOMAIN}.www;
+
+    real_ip_header CF-Connecting-IP;
+    real_ip_recursive on;
+${locations}
+}
+NGINXEOF
+    fi
+
+    # ── Порт 443 ────────────────────────────────────────────────────
+    # Только при настоящем сертификате: без него nginx не стартует,
+    # и установка падала бы на «nginx -t».
+    if [[ $use_ssl == "yes" ]]; then
+        cat >>/etc/nginx/sites-available/gamedock <<NGINXEOF
 
 server {
     listen 443 ssl;
@@ -1246,62 +2350,17 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-    client_max_body_size 128M;
-
-    # Ассеты
-    location /assets/ {
-        alias ${PANEL_DIR}/public/build/;
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-        access_log off;
-    }
-
-    location /storage/ {
-        alias ${PANEL_DIR}/storage/app/public/;
-        expires 7d;
-    }
-
-    # SSE-поток консоли игрового сервера
-    location ~ ^/panel/servers/\d+/console/stream$ {
-        proxy_pass http://gamedock_php;
-        proxy_http_version 1.1;
-        proxy_set_header Connection '';
-        proxy_buffering off;
-        proxy_cache off;
-        chunked_transfer_encoding off;
-        gzip off;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ ^/index\.php$ {
-        include fastcgi_params;
-        fastcgi_pass gamedock_php;
-        fastcgi_param SCRIPT_FILENAME ${PANEL_DIR}/public/index.php;
-        fastcgi_param DOCUMENT_ROOT ${PANEL_DIR}/public;
-        fastcgi_read_timeout 3600;
-        fastcgi_buffers 16 16k;
-        fastcgi_buffer_size 32k;
-    }
-
-    location ~ \.php$ {
-        return 404;
-    }
-
-    location ~ /\.(?!well-known) {
-        deny all;
-    }
+${locations}
 }
+NGINXEOF
+    fi
 
-# WSS-эндпоинт агентов — если панель общается в режиме inbound через nginx
-# (основной режим — отдельный процесс gamedock-wss на 9222)
+    # ── WSS-эндпоинт агентов ───────────────────────────────────────
+    # Основной режим — отдельный процесс gamedock-wss на 9222, этот блок
+    # нужен для входящих подключений. Без SSL слушает 9443 открытым текстом.
+    if [[ $use_ssl == "yes" ]]; then
+        cat >>/etc/nginx/sites-available/gamedock <<NGINXEOF
+
 server {
     listen 9443 ssl;
     listen [::]:9443 ssl;
@@ -1310,15 +2369,27 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem;
+NGINXEOF
+    else
+        cat >>/etc/nginx/sites-available/gamedock <<NGINXEOF
+
+server {
+    listen 9443;
+    listen [::]:9443;
+    server_name ${PANEL_DOMAIN};
+NGINXEOF
+    fi
+
+    cat >>/etc/nginx/sites-available/gamedock <<'NGINXEOF'
 
     location /agent/ws {
         proxy_pass http://127.0.0.1:9222;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header Host \$host;
-        proxy_set_header X-GameDock-Token \$http_x_gamedock_token;
-        proxy_set_header X-Node-Id \$http_x_node_id;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-GameDock-Token $http_x_gamedock_token;
+        proxy_set_header X-Node-Id $http_x_node_id;
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
         proxy_buffering off;
@@ -1326,16 +2397,20 @@ server {
 }
 NGINXEOF
 
+    # Подставляем пути в общий набор location'ов. Отдельным шагом, чтобы в
+    # heredoc не пришлось смешивать экранирование nginx (там $host) и
+    # подстановку переменных установщика (там $PANEL_DIR).
+    sed -i \
+        -e "s|@@PANEL_DIR@@|${PANEL_DIR}|g" \
+        -e "s|@@PHPMYADMIN_SNIPPET@@|${PHPMYADMIN_SNIPPET}|g" \
+        /etc/nginx/sites-available/gamedock
+
     ln -sf /etc/nginx/sites-available/gamedock /etc/nginx/sites-enabled/gamedock
     rm -f /etc/nginx/sites-enabled/default
 
-    # Заглушка на время выпуска сертификата
-    if [[ $WITH_SSL == "yes" ]] && [[ ! -f /etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem ]]; then
-        warn "Сертификат ещё не получен — временно отключаю проверку SSL"
-        sed -i 's/^    ssl_certificate/#    ssl_certificate/' /etc/nginx/sites-available/gamedock
+    if ! run_logged 10 nginx -t; then
+        fail "Конфигурация nginx некорректна. Смотрите /etc/nginx/sites-available/gamedock"
     fi
-
-    nginx -t 2>&1 | tee -a "$LOG_FILE" || fail "Конфигурация nginx некорректна"
 
     systemctl enable --now nginx
     systemctl reload nginx 2>/dev/null || systemctl restart nginx
@@ -1357,28 +2432,41 @@ setup_ssl() {
 
     local email="${SSL_EMAIL:-$PANEL_EMAIL}"
 
-    certbot certonly --webroot -w /var/www/certbot \
+    if ! run_logged 8 certbot certonly --webroot -w /var/www/certbot \
         -d "$PANEL_DOMAIN" -d "${PANEL_DOMAIN}.www" \
         --email "$email" \
         --agree-tos \
         --no-eff-email \
-        --non-interactive 2>&1 | tee -a "$LOG_FILE" | tail -5 || {
+        --non-interactive; then
         warn "Не удалось получить сертификат автоматически"
         warn "Проверьте, что домен ${PANEL_DOMAIN} указывает на ${PUBLIC_IP:-этот сервер}"
         warn "После исправления DNS выполните: certbot certonly --webroot -w /var/www/certbot -d ${PANEL_DOMAIN}"
         return
-    }
+    fi
 
-    # Certbot hook
+    # Конфиг nginx пересобираем целиком, а не правим sed'ом.
+    # Раньше здесь стояло раскомментирование строки ssl_certificate, но:
+    #   - блока listen 443 ssl на тот момент в файле не было вовсе — он не
+    #     создавался, пока сертификата нет;
+    #   - поэтому раскомментировать было нечего, и HTTPS просто не включался;
+    #   - а на следующем продлении сертификата хук искал строку, которой
+    #     в файле уже не было, и тихо ничего не делал.
+    # setup_nginx идемпотентен: сертификат появился — появятся и HTTPS-блоки.
+    setup_nginx
+
+    # Хук продления: пересобираем конфиг, чтобы новый сертификат подхватился
     cat >/etc/letsencrypt/renewal-hooks/deploy/gamedock-nginx <<'HOOKEOF'
 #!/bin/sh
-sed -i 's/^    ssl_certificate /    ssl_certificate /' /etc/nginx/sites-available/gamedock
-nginx -t && systemctl reload nginx
+# Продление сертификата: пересобрать конфиг nginx и перезагрузить его.
+# Раньше здесь был sed по строке ssl_certificate, который переставал находить
+# цель после первой же пересборки конфига.
+if nginx -t 2>/dev/null; then
+    systemctl reload nginx
+else
+    systemctl restart nginx
+fi
 HOOKEOF
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/gamedock-nginx
-
-    sed -i 's/^#    ssl_certificate /    ssl_certificate /' /etc/nginx/sites-available/gamedock
-    systemctl reload nginx
 
     ok "SSL-сертификат получен, автопродление включено"
 }
@@ -1511,8 +2599,10 @@ setup_agent_template() {
     step "Готовлю агента ноды"
 
     mkdir -p "$AGENT_DIR"
-    cp -a "$REPO_DIR/agent/." "$AGENT_DIR/"
-    cp -a "$REPO_DIR/game-images" "$GAME_IMAGES_DIR" 2>/dev/null || true
+    copy_tree "$REPO_DIR/agent" "$AGENT_DIR" "агент" \
+        || warn "Агент не развёрнут из $REPO_DIR/agent"
+    copy_tree "$REPO_DIR/game-images" "$GAME_IMAGES_DIR" "образы игр" \
+        || warn "Каталог образов игр не развёрнут"
 
     chown -R "$SERVICE_USER:$SERVICE_USER" "$AGENT_DIR" "$GAME_IMAGES_DIR"
 
@@ -1546,6 +2636,16 @@ AGENTENVEOF
 }
 
 setup_local_agent() {
+    # Раньше INSTALL_AGENT разбирался из аргументов, но нигде не читался:
+    # агент ставился на машину безусловно, а --no-agent (это же значение по
+    # умолчанию) не делал ничего. Для машины «только панель» это лишний
+    # systemd-юнит, node и каталоги игровых серверов.
+    if [[ $INSTALL_AGENT != "yes" ]]; then
+        log "Агент на эту машину не ставится — панель будет работать с нодами на других серверах"
+        log "  Если нода всё же нужна здесь, переустановите с ключом --with-agent"
+        return 0
+    fi
+
     step "Устанавливаю агента на эту машину"
 
     local node_id
@@ -1571,14 +2671,24 @@ AGENTENVEOF
         log "Ставлю Docker Engine…"
         install -m 0755 -d /etc/apt/keyrings
         # download.docker.com держит отдельные ветки для debian и ubuntu
-        curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        local docker_key
+        docker_key="$(mktemp)"
+        if fetch_with_retry "https://download.docker.com/linux/${OS_ID}/gpg" "$docker_key"; then
+            gpg --dearmor -o /etc/apt/keyrings/docker.gpg <"$docker_key"
+        else
+            rm -f "$docker_key"
+            warn "Не удалось скачать ключ Docker — репозиторий не подключён"
+            warn "Поставьте Docker вручную: https://docs.docker.com/engine/install/"
+            return
+        fi
+        rm -f "$docker_key"
         chmod a+r /etc/apt/keyrings/docker.gpg
 
         local repo_line="deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} ${OS_CODENAME} stable"
         echo "$repo_line" >/etc/apt/sources.list.d/docker.list
 
         apt_update
-        if ! apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | tail -5; then
+        if ! apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin </dev/null 2>&1 | tail -5; then
             fail "Не удалось поставить Docker из download.docker.com/linux/${OS_ID}"
         fi
 
@@ -1699,6 +2809,31 @@ print_summary() {
     local admin_pass
     admin_pass="$1"
 
+    # Блок phpMyAdmin собираем отдельно: либо показываем адрес и пароль,
+    # либо одну строку «не установлен». Пустой ${PMA_SUMMARY} в heredoc
+    # оставил бы после себя лишнюю пустую строку.
+    local PMA_SUMMARY=""
+    if [[ -n ${PHPMYADMIN_URL:-} && -f $PHPMYADMIN_CREDS ]]; then
+        # shellcheck disable=SC1090
+        . "$PHPMYADMIN_CREDS"
+        PMA_SUMMARY=$(cat <<PMAOUT
+  phpMyAdmin:    ${PHPMYADMIN_URL}
+  Логин:         ${PMA_USER}
+  Пароль:        ${PMA_PASS}
+PMAOUT
+        )
+        if [[ -n $PHPMYADMIN_ALLOW ]]; then
+            PMA_SUMMARY+="
+  Доступ с IP:  ${PHPMYADMIN_ALLOW}"
+        else
+            PMA_SUMMARY+="
+  Вход открыт с любого IP, но только по паролю выше."
+        fi
+        PMA_SUMMARY+=$'\n'
+    else
+        PMA_SUMMARY=$'\n  phpMyAdmin:    не установлен\n'
+    fi
+
     cat <<SUMMARYEOF
 
 $(echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════╗${NC}")
@@ -1712,6 +2847,7 @@ $(echo -e "${BOLD}${GREEN}╚═════════════════
   Режим нод:     ${NODE_MODE}
   Рантайм:       ${DEFAULT_RUNTIME}
   Версия панели: ${GAMEDOCK_VERSION}
+${PMA_SUMMARY}
 
   Включено:
     промокоды со скидкой    $( $PROMO_DISCOUNT =~ yes && echo "да" || echo "нет")
@@ -1754,6 +2890,141 @@ SUMMARYEOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+# Неинтерактивная установка пакетов
+# ═══════════════════════════════════════════════════════════════════
+
+# Готовим apt так, чтобы он ни разу не спросил пользователя ничего.
+#
+# Установка пакетов идёт через run_logged, а он выполняет команду в
+# подстановке `$(...)`. stdin при этом наследуется от терминала, поэтому
+# любой вопрос apt блокирует установку, пока пользователь не нажмёт Enter.
+#
+# Три источника вопросов, и все три закрываются по-разному:
+#   1. debconf-диалоги. DEBIAN_FRONTEND=noninteractive их подавляет, но
+#      только если задан ДО вызова apt, а не в отдельной функции.
+#   2. needrestart — на Debian 11/12/13 и Ubuntu 22.04/24.04 после крупных
+#      обновлений спрашивает, какие службы перезапустить. Он НЕ подчиняется
+#      DEBIAN_FRONTEND: без NEEDRESTART_MODE=a диалог появляется всегда.
+#   3. dpkg при изменении конфигурационных файлов. Лечится force-confold.
+setup_noninteractive() {
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=""
+
+    # needrestart надёжнее переключается файлом конфигурации, чем
+    # переменной окружения: значение из окружения теряется там, где apt
+    # вызывает хуки через sudo с чистым окружением.
+    if [[ -d /etc/needrestart/conf.d ]]; then
+        printf '%s\n' \
+            '$nrconf{REBOOT} = "a";' \
+            '$nrconf{APPRAISE} = "a";' \
+            >/etc/needrestart/conf.d/gamedock.conf 2>/dev/null || true
+    fi
+
+    # Тихая зона: без неё tzdata в неинтерактивном режиме падает с ошибкой.
+    if ! grep -qs ' Etc/UTC ' /etc/timezone 2>/dev/null; then
+        export TZ="${TZ:-Etc/UTC}"
+    fi
+
+    # Заранее отвечаем на самые частые debconf-вопросы, чтобы пакеты не
+    # зависали даже там, где noninteractive почему-то не сработал.
+    if command -v debconf-set-selections >/dev/null 2>&1; then
+        debconf-set-selections <<'DEBCONFEOF' 2>/dev/null || true
+tzdata tzdata/Areas select Etc
+tzdata tzdata/Zones/Etc select UTC
+mariadb-server mariadb-server/root_password password
+mariadb-server mariadb-server/root_password_again password
+mariadb-server mariadb-server/re-root-pass password
+mariadb-server mariadb-server/default-auth-override select Use Strong Password Encryption (RECOMMENDED)
+ssh-server ssh-server/permit-root-login select no
+DEBCONFEOF
+    fi
+}
+
+# Флаги apt, которыми сборка пакетов не должна вставать на вопрос.
+apt_quiet_flags() {
+    printf '%s\n' \
+        -y \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        -o Dpkg::Options::=--force-yes
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Предварительная проверка
+# ═══════════════════════════════════════════════════════════════════
+
+# Проверяем, что установка вообще дойдёт до конца, ДО установки пакетов.
+#
+# Без этой проверки пользователь узнаёт, что Composer недоступен, спустя
+# несколько минут после установки 52 пакетов — и узнаёт это так три раза
+# подряд, потому что до Composer дело не доходит. Проверка занимает секунды
+# и экономит время.
+preflight_dependencies() {
+    step "Проверяю доступность зависимостей"
+
+    local -a problems=()
+
+    # ── Composer ───────────────────────────────────────────────────
+    # Основной путь — пакет из репозитория дистрибутива, запасной —
+    # getcomposer.org. Предупреждаем, если ни один не сработает.
+    if command -v composer >/dev/null 2>&1; then
+        log "  Composer: уже установлен"
+    elif pkg_available composer; then
+        log "  Composer: пакет есть в репозиториях, поставлю оттуда"
+    elif curl -fsSI --connect-timeout 10 --max-time 25 \
+            https://getcomposer.org/installer >/dev/null 2>&1; then
+        log "  Composer: пакета в репозиториях нет, скачаю с getcomposer.org"
+    else
+        problems+=(
+            "Composer недоступен: пакета нет в репозиториях, а getcomposer.org не отвечает."
+        )
+    fi
+
+    # ── Репозиторий PHP ─────────────────────────────────────────────
+    # Нужен там, где в дистрибутиве PHP старее 8.2. Проверяем только когда
+    # он действительно понадобится, иначе лишняя задержка.
+    if [[ $OS_NEEDS_SURY -eq 1 ]] && [[ ! -s /usr/share/keyrings/sury-php.gpg ]]; then
+        if curl -fsSI --connect-timeout 10 --max-time 25 \
+                https://packages.sury.org/php/apt.gpg >/dev/null 2>&1; then
+            log "  packages.sury.org: отвечает"
+        else
+            problems+=(
+                "packages.sury.org недоступен, а в дистрибутиве PHP старее ${PHP_VERSION:-8.3}."
+            )
+        fi
+    fi
+
+    # ── Итог ────────────────────────────────────────────────────────
+    if (( ${#problems[@]} > 0 )); then
+        echo
+        warn "Предварительная проверка не пройдена — останавливаюсь до установки пакетов:"
+        echo
+        local p
+        for p in "${problems[@]}"; do
+            printf '   %s- %s%s\n' "$YELLOW" "$p" "$NC"
+        done
+        echo
+        fail "Устраните причину и запустите установщик снова. Так вы не потратите
+несколько минут на установку пакетов, которая всё равно прервётся.
+
+Чаще всего помогает:
+
+  • Если getcomposer.org или другое внешнее хранилище недоступно —
+    поставьте нужный пакет из репозитория дистрибутива заранее:
+        apt-get update && apt-get install -y composer
+
+  • Если внешние хосты режет провайдер или фильтр — проверьте доступ:
+        curl -I --max-time 15 https://getcomposer.org/installer
+
+  • Ничего не помогает — запустите установщик вручную, шаг за шагом,
+    и пришлите вывод шага, на котором он остановился."
+    fi
+
+    ok "Зависимости доступны, продолжаю"
+}
+
+# ═══════════════════════════════════════════════════════════════════
 # Главный сценарий
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1769,10 +3040,13 @@ main() {
     echo
 
     check_root
+    setup_noninteractive
     detect_distro
     ensure_cgroup_v2
     check_system
+    ensure_base_tools
     check_deps
+    preflight_dependencies
 
     # ── Диалог ─────────────────────────────────────────────────────
     step "Настройка панели"
@@ -1870,15 +3144,27 @@ main() {
 
     # ── Установка ─────────────────────────────────────────────────
     install_packages
-    create_service_user
+    # Исходники разворачиваем ДО создания каталогов установки: create_service_user
+    # создаёт $GAME_IMAGES_DIR, который лежит внутри $INSTALL_DIR, и git отказывается
+    # клонировать в непустой каталог. Обратный порядок давал
+    # «fatal: destination path '/opt/gamedock' already exists and is not an empty directory».
     detect_repo
+    create_service_user
     setup_database
     setup_redis
     setup_php
-    setup_panel
+    # Порядок важен: сначала исходники и каталоги, потом .env, и только
+    # потом зависимости. composer install вызывает artisan package:discover,
+    # который поднимает приложение и читает .env — при старом порядке
+    # установка падала на .env, дошедшем от прошлого прогона.
+    deploy_panel_sources
     setup_env
+    install_panel_deps
     run_migrations
     apply_hosting_config
+    # До setup_nginx: он делает nginx -t, и сниппет phpMyAdmin должен
+    # к этому моменту существовать — иначе include роняет проверку.
+    install_phpmyadmin
     setup_nginx
     setup_ssl
     setup_systemd

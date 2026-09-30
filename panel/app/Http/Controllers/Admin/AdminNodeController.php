@@ -62,7 +62,7 @@ class AdminNodeController extends Controller
 
     public function store(Request $request): RedirectResponse
     {
-        $data = $this->validate($request);
+        $data = $this->nodeRules($request);
 
         $node = $this->nodes->create($data);
 
@@ -87,7 +87,7 @@ class AdminNodeController extends Controller
 
     public function update(Request $request, Node $node): RedirectResponse
     {
-        $data = $this->validate($request, $node);
+        $data = $this->nodeRules($request, $node);
 
         $this->nodes->update($node, $data);
 
@@ -149,7 +149,16 @@ class AdminNodeController extends Controller
         return redirect()->route('admin.nodes')->with('success', __('admin.messages.node_deleted'));
     }
 
-    private function validate(Request $request, ?Node $node = null): array
+    /**
+     * Правила валидации ноды.
+     *
+     * Имя метода не может быть просто validate(): базовый Controller
+     * подтягивает трейт ValidatesRequests с публичным validate(), и
+     * объявление private-версии здесь понижало видимость — PHP падал с
+     * «Access level to …::validate() must be public» ещё при загрузке
+     * маршрутов, до первого запроса.
+     */
+    private function nodeRules(Request $request, ?Node $node = null): array
     {
         return $request->validate([
             'name' => ['required', 'string', 'max:120'],

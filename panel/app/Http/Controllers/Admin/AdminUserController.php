@@ -203,7 +203,7 @@ class AdminUserController extends Controller
             switch ($data['action']) {
                 case 'block':
                     if (! $request->user()->can('block', $user)) {
-                        continue;
+                        continue 2;
                     }
                     $user->forceFill([
                         'status' => User::STATUS_BLOCKED,
@@ -220,7 +220,7 @@ class AdminUserController extends Controller
 
                 case 'role':
                     if (! $request->user()->isSuperAdmin()) {
-                        continue;
+                        continue 2;
                     }
                     $user->assignRole($data['value'] ?? User::ROLE_USER);
                     $count++;
@@ -228,7 +228,7 @@ class AdminUserController extends Controller
 
                 case 'delete':
                     if (! $request->user()->isSuperAdmin() || $user->servers()->exists()) {
-                        continue;
+                        continue 2;
                     }
                     $user->delete();
                     $count++;

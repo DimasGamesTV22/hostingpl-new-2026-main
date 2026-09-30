@@ -17,6 +17,16 @@ class EmailVerificationController extends Controller
 {
     public function __construct(private readonly RegistrationService $registration) {}
 
+    /**
+     * Инвокаемый контроллер: маршрут задан как
+     * Route::get('/email/verify/{id}/{hash}', EmailVerificationController::class)
+     * — без метода. Без __invoke Laravel падает на загрузке маршрутов.
+     */
+    public function __invoke(Request $request, int $id, string $hash): RedirectResponse
+    {
+        return $this->verify($request, $id, $hash);
+    }
+
     public function verify(Request $request, int $id, string $hash): RedirectResponse
     {
         $user = User::find($id);
