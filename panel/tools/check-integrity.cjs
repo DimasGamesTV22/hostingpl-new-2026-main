@@ -8,7 +8,6 @@ const fs = require('fs');
 const files = [
   'C:/hostingpl/deploy/install.sh',
   'C:/hostingpl/deploy/agent.sh',
-  'C:/hostingpl/deploy/menu.sh',
   'C:/hostingpl/panel/tools/test-system-checks.sh',
   'C:/hostingpl/panel/tools/test-install-logic.sh',
   'C:/hostingpl/panel/tools/test-menu.sh',

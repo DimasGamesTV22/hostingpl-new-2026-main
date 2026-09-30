@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Тесты меню-установщика deploy/menu.sh.
+# Тесты меню, которое живёт внутри deploy/install.sh.
 #
 # Меню читает выбор как choice="$(read_choice)", то есть в под-шелле. Поэтому
 # очередь ответов держим В ФАЙЛЕ: правка массива наружу не уходит, а счётчик
@@ -13,7 +13,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-MENU="$ROOT/deploy/menu.sh"
+MENU="$ROOT/deploy/install.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -30,7 +30,9 @@ t_bad() { fail=$((fail + 1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [[ $# -g
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # Копия меню без главного вызова
-sed 's|^main "\$@"$|true  # main отключён в тесте|' "$MENU" > "$TMP/menu.sh"
+# Копия для подгрузки. Нижний код защищён проверкой BASH_SOURCE, поэтому
+# `source` не запустит установку и вырезать `main "$@"` не нужно.
+cp "$MENU" "$TMP/menu.sh"
 
 ANS="$TMP/answers"
 
@@ -43,6 +45,7 @@ run_menu() {
     (
         # shellcheck disable=SC1090
         . "$TMP/menu.sh"
+        set +eu   # установщик объявил set -euo pipefail при source
 
         read_choice() {
             [[ -s $ANS ]] || return 1        # пусто → «нет TTY» → выход
@@ -140,6 +143,7 @@ out="$(
     printf '2\nn\n' > "$ANS"
     (
         . "$TMP/menu.sh"
+        set +eu   # установщик объявил set -euo pipefail при source
         read_choice() {
             [[ -s $ANS ]] || return 1
             local line; line="$(head -1 "$ANS")"
@@ -166,6 +170,7 @@ out="$(
     printf '2\n' > "$ANS"
     (
         . "$TMP/menu.sh"
+        set +eu   # установщик объявил set -euo pipefail при source
         read_choice() { return 1; }
         pause()      { :; }
         ask()        { printf '%s' "${2:-}"; }

@@ -28,7 +28,6 @@ eq() {
 
 # ── Готовим исполняемую копию установщика без main() ────────────────────
 sed -e 's#^LOG_FILE=.*#LOG_FILE='"$TMP"'/test.log#' \
-    -e '/^main "\$@"$/d' \
     "$ROOT/deploy/install.sh" > "$TMP/install.sh"
 
 # shellcheck disable=SC1090

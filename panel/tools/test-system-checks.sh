@@ -12,6 +12,11 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Путь к установщику. Объявляем сразу после ROOT: на него ссылаются
+# проверки выше того места, где переменная появилась впервые, а тест
+# работает с set -u, и обращение к несозданной переменной обрывает его.
+INSTALL_SH="$ROOT/deploy/install.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -26,10 +31,20 @@ eq() {
     if [[ "$2" == "$3" ]]; then t_ok "$1"; else t_bad "$1" "ожидалось '$3', получено '$2'"; fi
 }
 
-# Копия установщика без главного вызова; LOG_FILE — во временный каталог
-sed -e '/^main "\$@"$/d' \
-    -e "s|^LOG_FILE=.*|LOG_FILE=$TMP/install.log|" \
+# Копия установщика; LOG_FILE — во временный каталог.
+# Строку `main "$@"` вырезать не нужно: в install.sh есть защита
+# [[ "${BASH_SOURCE[0]}" == "${0}" ]], и при source нижний код не выполняется.
+sed     -e "s|^LOG_FILE=.*|LOG_FILE=$TMP/install.log|" \
     "$ROOT/deploy/install.sh" > "$TMP/install.sh"
+
+# Проверяем, что копия действительно создалась. Раньше её отсутствие
+# обнаруживалось только каскадом чужих провалов (17 проверок падали
+# не по своей причине), и понять, где сломалось, было нечем.
+if [[ ! -s $TMP/install.sh ]]; then
+    echo "FAIL  не удалось создать $TMP/install.sh (команда sed собрана неверно)"
+    exit 1
+fi
+
 
 # Вызывает функцию из установщика в отдельном под-шелле
 call() {
@@ -183,10 +198,10 @@ else
 fi
 
 # У menu.sh свои логгеры — проверяем и их
-if grep -qE '^msg\(\)|printf .%s\[GameDock\]%s %s' "$ROOT/deploy/menu.sh"; then
-    t_ok "menu.sh: логгеры на месте"
+if grep -qE '^msg\(\)|printf .%s\[GameDock\]%s %s' "$INSTALL_SH"; then
+t_ok "install.sh: логгеры меню на месте"
 else
-    t_bad "menu.sh: логгеры на месте" "не найден msg()"
+t_bad "install.sh: логгеры меню на месте"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -568,11 +583,23 @@ else
     t_ok "в подсказках нет несуществующих ключей"
 fi
 
-# 12. main вызывается последней строкой — функции определены до вызова
-if [[ "$(grep -n '^main "\$@"' "$INSTALL_SH" | tail -1 | cut -d: -f1)" == "$(wc -l <"$INSTALL_SH" | tr -d ' ')" ]]; then
-    t_ok "main вызывается последней строкой"
+# 12. Нижний код выполняется только при запуске как скрипт
+#
+# Раньше тест требовал, чтобы `main "$@"` был последней строкой. Теперь в
+# конце файла защита [[ "${BASH_SOURCE[0]}" == "${0}" ]]. Без неё
+# `source install.sh` — а так подгружают эти же тесты — запускал бы установку.
+guard=$(grep -n 'BASH_SOURCE\[0\]' "$INSTALL_SH" | head -1 | cut -d: -f1)
+main_call=$(grep -n '^ *main "\$@"$' "$INSTALL_SH" | tail -1 | cut -d: -f1)
+last_nonempty=$(grep -nv '^[[:space:]]*$' "$INSTALL_SH" | tail -1)
+
+if [[ -n $guard && -n $main_call ]]; then
+    if (( main_call > guard )) && [[ "$last_nonempty" == *fi ]]; then
+        t_ok "нижний код защищён от source, main вызывается внутри"
+    else
+        t_bad "main вызывается внутри защиты" "защита $guard, вызов $main_call, последняя строка: $last_nonempty"
+    fi
 else
-    t_bad "main вызывается последней строкой" "после main есть ещё код"
+    t_bad "нижний код защищён от source" "нет проверки BASH_SOURCE"
 fi
 
 # 13. Уже подключённый репозиторий не качается заново.
@@ -782,7 +809,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════
 head_ "Меню берёт соседний установщик"
 
-MENU_SH="$ROOT/deploy/menu.sh"
+MENU_SH="$INSTALL_SH"   # меню живёт внутри install.sh
 
 if grep -q '^script_source()' "$MENU_SH"; then
     t_ok "script_source объявлена"
@@ -1608,6 +1635,163 @@ if grep -q 'artisan config:clear" 2>&1' <<<"$AHC_BODY" && grep -q 'fail ' <<<"$A
     t_ok "ошибка artisan в apply_hosting_config не молчит"
 else
     t_bad "ошибка artisan не молчит" "вывод заглушён, установка падает без причины"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 28. Помощники, вызываемые внутри $( ) при заполнении .env
+#
+# .env пишется некавыченным heredoc, поэтому значения вычисляются
+# подстановкой команд. Любой вывод в stdout такого помощника становится
+# частью значения ключа, и Laravel падает с «Encountered unexpected
+# whitespace at […]» — на composer install, задолго до самих флагов.
+# ═══════════════════════════════════════════════════════════════════
+head_ "Чистота stdout у помощников .env"
+
+for fn in yn_bool pay_enabled any_pay_enabled; do
+    body=$(sed -n "/^${fn}()/,/^}/p" "$INSTALL_SH")
+
+    # Любой warn/log/ok/fail/step внутри функции обязан идти в stderr.
+    # Вызовы без >&2 считаем нарушением.
+    noisy=$(grep -E '^[[:space:]]*(warn|log|ok|fail|step)[[:space:]]' <<<"$body" \
+        | grep -v '>&2' || true)
+
+    if [[ -z $noisy ]]; then
+        t_ok "$fn не пишет в stdout"
+    else
+        t_bad "$fn не пишет в stdout" "вывод попадёт в значение ключа: $noisy"
+    fi
+
+    # printf должен выдавать само значение: ровно true или false.
+    # printf может стоять в конце строки case: «…|on) printf true ;;»
+    outs=$(grep -cE '(^|[[:space:];])printf (true|false)' <<<"$body" || true)
+    if [[ $outs -ge 1 ]]; then
+        t_ok "$fn печатает значение"
+    else
+        t_bad "$fn печатает значение" "нет ни одного printf true/false"
+    fi
+done
+
+# setup_env должен проверять флаги до того, как панель их прочитает.
+ENV_FN=$(sed -n '/^setup_env()/,/^}/p' "$INSTALL_SH")
+if grep -q 'GD_TRIAL_DAYS=\[0-9\]' <<<"$ENV_FN" && grep -q 'true|false' <<<"$ENV_FN"; then
+    t_ok "setup_env проверяет значения флагов в .env"
+else
+    t_bad "setup_env проверяет флаги" "мусорное значение уедет в Laravel и упадёт там"
+fi
+
+# Проверка обязана стоять после heredoc, иначе файла ещё нет.
+env_end=$(grep -n '^ENVEOF' <<<"$ENV_FN" | head -1 | cut -d: -f1)
+chk_line=$(grep -n 'GD_TRIAL_DAYS=\[0-9\]' <<<"$ENV_FN" | head -1 | cut -d: -f1)
+if [[ -n $env_end && -n $chk_line ]] && (( chk_line > env_end )); then
+    t_ok "проверка флагов идёт после записи .env"
+else
+    t_bad "проверка флагов после записи .env" "порядок: heredoc $env_end, проверка $chk_line"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 29. Агент на «панельной» машине и воркеры очереди в автозагрузке
+#
+# Падение: /etc/gamedock/agent.env.example — каталога не существовало,
+# а setup_agent_template вызывалась даже с --no-agent. Сверх того она
+# копировала файл в формате KEY=VALUE по пути agent.config.json, который
+# агент читает через JSON.parse: конфиг молча игнорировался, а рабочий
+# JSON из репозитория затирался.
+#
+# Отдельно: у шаблона gamedock-queue@.service не было секции [Install],
+# поэтому systemctl enable инстансов падал с «no installation config».
+# Воркеры запускались (из-за --now), но после перезагрузки не
+# поднимались — установка при этом выглядела успешной.
+# ═══════════════════════════════════════════════════════════════════
+head_ "Агент и автозагрузка очереди"
+
+SAT_BODY=$(sed -n '/^setup_agent_template()/,/^}/p' "$INSTALL_SH")
+
+# Каталог /etc/gamedock обязан создаваться до первой записи в него
+if [[ -n $SAT_BODY ]] && grep -q 'mkdir -p /etc/gamedock' <<<"$SAT_BODY" \
+   && grep -q 'agent.env.example' <<<"$SAT_BODY"; then
+    mkdir_line=$(grep -n 'mkdir -p /etc/gamedock' <<<"$SAT_BODY" | head -1 | cut -d: -f1)
+    write_line=$(grep -n 'cat >/etc/gamedock/agent.env.example' <<<"$SAT_BODY" | head -1 | cut -d: -f1)
+    if (( mkdir_line < write_line )); then
+        t_ok "каталог /etc/gamedock создаётся до записи"
+    else
+        t_bad "каталог /etc/gamedock создаётся до записи" "mkdir $mkdir_line, запись $write_line"
+    fi
+else
+    t_bad "каталог /etc/gamedock создаётся" "нет mkdir -p /etc/gamedock"
+fi
+
+# --no-agent должен пропускать всю подготовку агента
+if grep -q 'INSTALL_AGENT != "yes"' <<<"$SAT_BODY"; then
+    t_ok "подготовка агента уважает --no-agent"
+else
+    t_bad "подготовка агента уважает --no-agent" "ставится даже без агента"
+fi
+
+# Копировать .env в agent.config.json нельзя: агент парсит его как JSON
+if grep -q 'agent.env.example "$AGENT_DIR/agent.config.json"' "$INSTALL_SH"; then
+    t_bad "JSON-конфиг агента не затирается" ".env копируется в agent.config.json"
+else
+    t_ok "JSON-конфиг агента не затирается"
+fi
+
+# Шаблон конфигурации должен содержать подставленные значения
+if grep -q "<<'AGENTENVEOF'" <<<"$SAT_BODY"; then
+    t_bad "шаблон конфигурации с подстановками" "heredoc кавыченный — останутся литералы"
+else
+    t_ok "шаблон конфигурации с подстановками"
+fi
+
+# Шаблон юнита очереди пишется один раз и содержит [Install]
+UNIT_BODY=$(sed -n '/cat >\/etc\/systemd\/system\/gamedock-queue@.service/,/^EOF$/p' "$INSTALL_SH")
+if [[ -n $UNIT_BODY ]]; then
+    t_ok "шаблон юнита очереди описан"
+else
+    t_bad "шаблон юнита очереди описан" "блок не найден"
+fi
+
+if grep -q '^\[Install\]$' <<<"$UNIT_BODY"; then
+    t_ok "у шаблона очереди есть [Install]"
+else
+    t_bad "у шаблона очереди есть [Install]" "без него enable инстансов не работает"
+fi
+
+if grep -q 'WantedBy=multi-user.target' <<<"$UNIT_BODY"; then
+    t_ok "шаблон очереди включается в multi-user.target"
+else
+    t_bad "шаблон очереди включается в multi-user.target" "в автозагрузку не попадёт"
+fi
+
+# Запись шаблона не должна быть внутри цикла по числу воркеров
+queue_in_loop=0
+i=1
+while [[ $i -le $(wc -l <"$INSTALL_SH") ]]; do
+    line=$(sed -n "${i}p" "$INSTALL_SH")
+    if [[ $line == 'for i in $(seq 1 $QUEUE_WORKERS); do' ]]; then
+        next=$(sed -n "$((i + 1))p" "$INSTALL_SH")
+        if [[ $next == *gamedock-queue@.service* ]]; then
+            queue_in_loop=1
+        fi
+    fi
+    i=$(( i + 1 ))
+done
+
+if [[ $queue_in_loop -eq 0 ]]; then
+    t_ok "шаблон очереди не пишется в цикле"
+else
+    t_bad "шаблон очереди не пишется в цикле" "тот же файл пишется несколько раз"
+fi
+
+# Включать надо шаблон, а не инстансы
+if grep -q 'systemctl enable "gamedock-queue@.service"' "$INSTALL_SH"; then
+    t_ok "в автозагрузку включается шаблон очереди"
+else
+    t_bad "включается шаблон очереди" "нет enable для gamedock-queue@.service"
+fi
+
+if grep -q 'enable --now "gamedock-queue@' "$INSTALL_SH"; then
+    t_bad "инстансы очереди не включаются поштучно" "enable инстанса без [Install] падает"
+else
+    t_ok "инстансы очереди не включаются поштучно"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
