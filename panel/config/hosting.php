@@ -166,15 +166,24 @@ return [
     */
     'marketing' => [
         // Промокоды: скидка на оплату
-        'promo_discount' => ['enabled' => true, 'max_percent' => 90],
+        'promo_discount' => [
+            'enabled' => (bool) env('GD_PROMO_DISCOUNT', true),
+            'max_percent' => 90,
+        ],
         // Промокоды: добавить дни к аренде
-        'promo_duration' => ['enabled' => true, 'max_days' => 365],
+        'promo_duration' => [
+            'enabled' => (bool) env('GD_PROMO_DURATION', true),
+            'max_days' => 365,
+        ],
         // Промокоды: разовый бонус (слоты / RAM / баланс)
-        'promo_bonus' => ['enabled' => true, 'max_bonus_rub' => 1000.0],
+        'promo_bonus' => [
+            'enabled' => (bool) env('GD_PROMO_BONUS', true),
+            'max_bonus_rub' => 1000.0,
+        ],
 
         // Реферальная программа
         'referral' => [
-            'enabled' => true,
+            'enabled' => (bool) env('GD_REFERRAL', true),
             'reward_referrer_rub' => 100.0,     // пригласившему
             'reward_referred_rub' => 100.0,     // новичку
             'reward_after_payment' => true,     // начислять после первой оплаты
@@ -183,7 +192,7 @@ return [
 
         // Секретные коды для игроков (игрок вводит в чате — начисляется бонус)
         'secret_codes' => [
-            'enabled' => true,
+            'enabled' => (bool) env('GD_SECRET_CODES', true),
             'allow_in_game_chat' => true,   // перехват команд в консоли сервера
             'allow_personal_codes' => true, // каждый игрок может завести свои коды
             'prefixes' => ['//', '!', '/promo'],
@@ -191,8 +200,8 @@ return [
 
         // Тестовый период при регистрации
         'trial' => [
-            'enabled' => true,
-            'days' => 3,
+            'enabled' => (bool) env('GD_TRIAL', true),
+            'days' => (int) env('GD_TRIAL_DAYS', 3),
             'tariff' => 'trial',   // id тарифа-триала, создаётся сидером
         ],
     ],
@@ -458,11 +467,11 @@ return [
     | здесь — только флаг включения и лимиты.
     */
     'payments' => [
-        'enabled' => true,
+        'enabled' => (bool) env('GD_PAYMENTS_ENABLED', true),
         'methods' => [
-            'wallet' => ['enabled' => true, 'label' => 'Баланс в панели'],
+            'wallet' => ['enabled' => (bool) env('GD_PAY_WALLET', true), 'label' => 'Баланс в панели'],
             'yookassa' => [
-                'enabled' => true,
+                'enabled' => (bool) env('GD_PAY_YOOKASSA', false),
                 'label' => 'ЮKassa (карты, СБП, ЮMoney)',
                 'shop_id' => env('GD_YOOKASSA_SHOP_ID', ''),
                 'secret_key' => env('GD_YOOKASSA_SECRET_KEY', ''),
@@ -470,20 +479,20 @@ return [
                 'idempotence' => true,
             ],
             'tinkoff' => [
-                'enabled' => false,
+                'enabled' => (bool) env('GD_PAY_TINKOFF', false),
                 'label' => 'Т-Банк Интернет-магазин',
                 'terminal_key' => env('GD_TINKOFF_TERMINAL_KEY', ''),
                 'password' => env('GD_TINKOFF_PASSWORD', ''),
             ],
             'cryptobot' => [
-                'enabled' => true,
+                'enabled' => (bool) env('GD_PAY_CRYPTOBOT', false),
                 'label' => 'Криптобот (Telegram)',
                 'token' => env('GD_CRYPTOBOT_TOKEN', ''),
                 'crypto' => ['TON', 'USDT', 'BTC', 'ETH'],
                 'expire_minutes' => 30,
             ],
             'manual' => [
-                'enabled' => true,
+                'enabled' => (bool) env('GD_PAY_MANUAL', true),
                 'label' => 'Ручной приём (карта/перевод)',
                 'notify_email' => env('GD_SUPPORT_EMAIL', 'support@example.com'),
             ],

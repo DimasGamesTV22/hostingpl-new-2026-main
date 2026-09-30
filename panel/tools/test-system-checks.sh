@@ -1517,6 +1517,100 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 27. Настройки панели идут через .env, а не правкой PHP-файла
+#
+# Установщик раньше правил config/hosting.php регулярными выражениями.
+# Одна из подстановок съедала три строки блока 'trial', после чего
+# синтаксис файла ломался и падал любой artisan — установка завершалась
+# с кодом 1 и без единого сообщения. Теперь конфиг читает значения через
+# env(), и установщик ничего в нём не правит.
+# ═══════════════════════════════════════════════════════════════════
+head_ "Настройки панели через .env"
+
+HOSTING_PHP="$ROOT/panel/config/hosting.php"
+
+AHC_BODY=$(sed -n '/^apply_hosting_config()/,/^}/p' "$INSTALL_SH")
+# Комментарии отбрасываем: в функции есть пояснение, от чего именно мы
+# отказались, и grep по нему давал бы ложное срабатывание.
+AHC_CODE=$(grep -v '^[[:space:]]*#' <<<"$AHC_BODY")
+
+if grep -q 'preg_replace' <<<"$AHC_CODE" || grep -q 'file_put_contents' <<<"$AHC_CODE"; then
+    t_bad "установщик не правит config/hosting.php" "внутри есть регулярная правка PHP-файла"
+else
+    t_ok "установщик не правит config/hosting.php"
+fi
+
+# Ответы диалога обязаны попасть в .env, иначе выбор пользователя теряется
+ENV_BODY=$(sed -n '/^setup_env()/,/^ENVEOF/p' "$INSTALL_SH")
+for key in GD_PROMO_DISCOUNT GD_PROMO_DURATION GD_PROMO_BONUS GD_REFERRAL \
+           GD_SECRET_CODES GD_TRIAL GD_TRIAL_DAYS; do
+    if grep -qE "^${key}=" <<<"$ENV_BODY"; then
+        t_ok "$key попадает в .env"
+    else
+        t_bad "$key попадает в .env" "ответ диалога не записывается — теряется"
+    fi
+done
+
+for key in GD_PAY_YOOKASSA GD_PAY_TINKOFF GD_PAY_CRYPTOBOT GD_PAY_MANUAL GD_PAYMENTS_ENABLED; do
+    if grep -qE "^${key}=" <<<"$ENV_BODY"; then
+        t_ok "$key попадает в .env"
+    else
+        t_bad "$key попадает в .env" "способ оплаты не настраивается"
+    fi
+done
+
+# Флаги обязаны быть true/false: Laravel превращает в bool только эти строки.
+# Значение «no» осталось бы строкой, и (bool)"no" дал бы true.
+for key in GD_PROMO_DISCOUNT GD_REFERRAL GD_SECRET_CODES GD_TRIAL GD_PAY_MANUAL; do
+    line=$(grep -E "^${key}=" <<<"$ENV_BODY" | head -1)
+    if grep -q 'yn_bool\|pay_enabled\|any_pay_enabled' <<<"$line"; then
+        t_ok "$key записан через конвертер в true/false"
+    else
+        t_bad "$key записан через конвертер" "yes/no не станет bool — флаг не выключится"
+    fi
+done
+
+if grep -q '^yn_bool()' "$INSTALL_SH" && grep -q '^pay_enabled()' "$INSTALL_SH" \
+   && grep -q '^any_pay_enabled()' "$INSTALL_SH"; then
+    t_ok "конвертеры ответов диалога объявлены"
+else
+    t_bad "конвертеры ответов диалога объявлены" "нет yn_bool/pay_enabled/any_pay_enabled"
+fi
+
+# Хелпер должен быть на верхнем уровне. Если он окажется внутри другой
+# функции, определится только при её вызове — и будет отсутствовать,
+# когда понадобится.
+helper_nested=$(awk '
+    /^[a-z_]+\(\) \{$/ && !/^(yn_bool|pay_enabled|any_pay_enabled)\(\) \{$/ { inside=1 }
+    /^\}$/ { inside=0 }
+    inside && /^(yn_bool|pay_enabled|any_pay_enabled)\(\) \{$/ { print NR }
+' "$INSTALL_SH")
+
+if [[ -z $helper_nested ]]; then
+    t_ok "хелперы объявлены на верхнем уровне"
+else
+    t_bad "хелперы на верхнем уровне" "вложены в функции: строки $helper_nested"
+fi
+
+# Конфиг обязан читать те же ключи через env()
+for key in GD_PROMO_DISCOUNT GD_REFERRAL GD_SECRET_CODES GD_TRIAL \
+           GD_PAY_YOOKASSA GD_PAY_TINKOFF GD_PAY_CRYPTOBOT GD_PAY_MANUAL; do
+    if grep -q "env('$key'" "$HOSTING_PHP"; then
+        t_ok "config/hosting.php читает $key"
+    else
+        t_bad "config/hosting.php читает $key" "ключ есть в .env, но конфиг его не видит"
+    fi
+done
+
+# Провал artisan не должен быть молчаливым: раньше вывод уходил в /dev/null
+# и установщик просто завершался с кодом 1 без объяснения.
+if grep -q 'artisan config:clear" 2>&1' <<<"$AHC_BODY" && grep -q 'fail ' <<<"$AHC_BODY"; then
+    t_ok "ошибка artisan в apply_hosting_config не молчит"
+else
+    t_bad "ошибка artisan не молчит" "вывод заглушён, установка падает без причины"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 printf '\nПройдено: %d, провалено: %d\n' "$pass" "$fail"
 [[ $fail -eq 0 ]] || exit 1
 

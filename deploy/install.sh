@@ -1469,6 +1469,47 @@ REDISEOF
 
 # ═══════════════════════════════════════════════════════════════════
 # Установка панели
+
+# ═══════════════════════════════════════════════════════════════════
+# Вспомогательные функции
+# ═══════════════════════════════════════════════════════════════════
+
+# Переводит ответ диалога (yes/no, 1/0, true/false, on/off) в строку,
+# которую понимает env() в Laravel. Преобразуются только «true» и
+# «false»: значение «no» осталось бы строкой, и (bool)"no" дал бы true —
+# то есть выключенный флаг оказался бы включённым.
+yn_bool() {
+    case "${1,,}" in
+        yes|y|1|true|on) printf true ;;
+        *) printf false ;;
+    esac
+}
+
+# Способ оплаты включается, только если на него согласились И ключи
+# введены. Иначе панель предлагает способ, который не сработает.
+pay_enabled() {
+    local answer="$1" keys="$2"
+    if [ "$(yn_bool "$answer")" != true ]; then
+        printf false
+        return
+    fi
+    if [ -z "$keys" ]; then
+        warn "Способ оплаты выбран, но ключи не введены — оставляю его выключенным"
+        printf false
+        return
+    fi
+    printf true
+}
+
+# Общий флаг оплаты: true, если доступен хоть один способ.
+any_pay_enabled() {
+    if [ "$(yn_bool "$PAY_MANUAL")" = true ] || [ "$(yn_bool "$PAY_YOOKASSA")" = true ]; then
+        printf true
+        return
+    fi
+    printf false
+}
+
 # ═══════════════════════════════════════════════════════════════════
 
 setup_php() {
@@ -1777,10 +1818,28 @@ GD_SYSTEM_USER="${SERVICE_USER}"
 GD_SYSTEM_GROUP="${SERVICE_GROUP}"
 GD_AGENT_INBOUND=true
 
+# Маркетинг: ответы диалога установщика. Именно true/false — только эти
+# значения Laravel превращает в bool.
+GD_PROMO_DISCOUNT=$(yn_bool "$PROMO_DISCOUNT")
+GD_PROMO_DURATION=$(yn_bool "$PROMO_DURATION")
+GD_PROMO_BONUS=$(yn_bool "$PROMO_BONUS")
+GD_REFERRAL=$(yn_bool "$REFERRAL")
+GD_SECRET_CODES=$(yn_bool "$SECRET_CODES")
+GD_TRIAL=$(yn_bool "$TRIAL")
+GD_TRIAL_DAYS=${TRIAL_DAYS:-3}
+
 GD_TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
 GD_TELEGRAM_ADMIN_CHAT_ID="${TELEGRAM_ADMIN_CHAT}"
 
-GD_PAYMENTS_ENABLED=true
+# Оплата. Общий флаг включается, если доступен хотя бы один способ.
+# Провайдер включаем только если ключи от него действительно введены:
+# включённый, но не настроенный способ подводит клиента к ошибке оплаты.
+GD_PAY_YOOKASSA=$(pay_enabled "$PAY_YOOKASSA" "$YOOKASSA_SHOP_ID")
+GD_PAY_TINKOFF=$(pay_enabled "$PAY_TINKOFF" "$TINKOFF_TERMINAL")
+GD_PAY_CRYPTOBOT=$(pay_enabled "$PAY_CRYPTOBOT" "$CRYPTOBOT_TOKEN")
+GD_PAY_MANUAL=$(yn_bool "$PAY_MANUAL")
+GD_PAY_WALLET=true
+GD_PAYMENTS_ENABLED=$(any_pay_enabled)
 GD_YOOKASSA_SHOP_ID="${YOOKASSA_SHOP_ID}"
 GD_YOOKASSA_SECRET_KEY="${YOOKASSA_SECRET}"
 GD_TINKOFF_TERMINAL_KEY="${TINKOFF_TERMINAL}"
@@ -1819,79 +1878,35 @@ apply_hosting_config() {
     step "Настраиваю режимы панели по вашим ответам"
 
     cd "$PANEL_DIR"
-    local config_file="config/hosting.php"
 
-    backup_file "$config_file"
+    # Настройки передаются через .env, который создал setup_env, а читаются
+    # в config/hosting.php через env().
+    #
+    # Раньше здесь был PHP-скрипт с preg_replace, который правил сам
+    # config/hosting.php по регулярным выражениям. Это оказалось хрупким
+    # способом: одна из подстановок съедала три строки блока 'trial' и ломала
+    # синтаксис файла, после чего падал любой artisan — установщик завершался
+    # с кодом 1 и без единого сообщения. Правкой PHP-файла установщику
+    # заниматься нечего.
+    log "  node_mode=$NODE_MODE runtime=$DEFAULT_RUNTIME промо=$([ "$PROMO_DISCOUNT" = yes ] && echo да || echo нет) \
+рефералка=$([ "$REFERRAL" = yes ] && echo да || echo нет) коды=$([ "$SECRET_CODES" = yes ] && echo да || echo нет) \
+тест=$([ "$TRIAL" = yes ] && echo "${TRIAL_DAYS} дн" || echo нет)"
 
-    # Значения из диалога установщика — в окружение для PHP-скрипта
-    export GD_NODE_MODE="$NODE_MODE"
-    export GD_RUNTIME="$DEFAULT_RUNTIME"
-    export GD_PROMO_DISCOUNT="$PROMO_DISCOUNT"
-    export GD_PROMO_DURATION="$PROMO_DURATION"
-    export GD_PROMO_BONUS="$PROMO_BONUS"
-    export GD_REFERRAL="$REFERRAL"
-    export GD_SECRET_CODES="$SECRET_CODES"
-    export GD_TRIAL="$TRIAL"
-    export GD_TRIAL_DAYS="$TRIAL_DAYS"
-    export GD_PAY_YOOKASSA="$PAY_YOOKASSA"
-    export GD_PAY_TINKOFF="$PAY_TINKOFF"
-    export GD_PAY_CRYPTOBOT="$PAY_CRYPTOBOT"
-    export GD_PAY_MANUAL="$PAY_MANUAL"
+    # Проверяем, что конфиг вообще читается. Раньше этот вызов шёл с
+    # >/dev/null 2>&1, и его провал ронял установку молча.
+    local clear_out
+    if ! clear_out="$(su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && php artisan config:clear" 2>&1)"; then
+        fail "Панель не читает свою конфигурацию:
 
-    php <<'PHPEOF'
-<?php
-$file = 'config/hosting.php';
-$content = file_get_contents($file);
+$clear_out
 
-function bool(bool $value): string { return $value ? 'true' : 'false'; }
-
-$replacements = [
-    "/'node_mode' => env\('GD_NODE_MODE', '[^']*'\)/" =>
-        "'node_mode' => env('GD_NODE_MODE', '" . getenv('GD_NODE_MODE') . "')",
-    "/'default' => env\('GD_RUNTIME', '[^']*'\)/" =>
-        "'default' => env('GD_RUNTIME', '" . getenv('GD_RUNTIME') . "')",
-];
-
-foreach ($replacements as $pattern => $replacement) {
-    $content = preg_replace($pattern, $replacement, $content, 1);
-}
-
-$flags = [
-    'promo_discount' => getenv('GD_PROMO_DISCOUNT') === 'yes',
-    'promo_duration' => getenv('GD_PROMO_DURATION') === 'yes',
-    'promo_bonus'    => getenv('GD_PROMO_BONUS') === 'yes',
-    'referral'       => getenv('GD_REFERRAL') === 'yes',
-    'secret_codes'   => getenv('GD_SECRET_CODES') === 'yes',
-    'trial'          => getenv('GD_TRIAL') === 'yes',
-    'yookassa'       => getenv('GD_PAY_YOOKASSA') === 'yes',
-    'tinkoff'        => getenv('GD_PAY_TINKOFF') === 'yes',
-    'cryptobot'      => getenv('GD_PAY_CRYPTOBOT') === 'yes',
-    'manual'         => getenv('GD_PAY_MANUAL') === 'yes',
-];
-
-foreach ($flags as $key => $enabled) {
-    $pattern = "/('" . $key . "' => \[.*?'enabled' => )(?:true|false)/s";
-    $content = preg_replace($pattern, "$1" . bool($enabled), $content, 1);
-}
-
-$days = (int) getenv('GD_TRIAL_DAYS');
-if ($days > 0) {
-    $content = preg_replace("/('trial' => \[.*?'days' => )\d+/s", "$1" . $days, $content, 1);
-}
-
-file_put_contents($file, $content);
-echo "  ✓ config/hosting.php: node_mode=" . getenv('GD_NODE_MODE')
-    . " runtime=" . getenv('GD_RUNTIME')
-    . " промо=" . ($flags['promo_discount'] ? 'да' : 'нет')
-    . " рефералка=" . ($flags['referral'] ? 'да' : 'нет')
-    . " секретные коды=" . ($flags['secret_codes'] ? 'да' : 'нет')
-    . " тест=" . ($flags['trial'] ? $days . ' дн' : 'нет') . "\n";
-PHPEOF
-
-    su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && php artisan config:clear" >/dev/null 2>&1
+Обычно это синтаксическая ошибка в config/hosting.php. Проверьте:
+  php -l $PANEL_DIR/config/hosting.php"
+    fi
 
     ok "Режимы панели настроены"
 }
+
 
 # ═══════════════════════════════════════════════════════════════════
 # phpMyAdmin
