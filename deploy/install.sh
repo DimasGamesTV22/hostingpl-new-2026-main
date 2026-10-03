@@ -48,6 +48,7 @@ GAMEDOCK_BRANCH="${GAMEDOCK_BRANCH:-main}"
 INSTALL_DIR="${GAMEDOCK_INSTALL_DIR:-/opt/gamedock}"
 PANEL_DIR="$INSTALL_DIR/panel"
 AGENT_DIR="$INSTALL_DIR/agent"
+BOT_DIR="$INSTALL_DIR/bot"
 GAME_IMAGES_DIR="${GAME_IMAGES_DIR:-/opt/gamedock/game-images}"
 STATE_DIR=/var/lib/gamedock
 LOG_FILE=/var/log/gamedock-install.log
@@ -80,6 +81,9 @@ PANEL_NAME="GameDock"
 NODE_MODE="auto"
 DEFAULT_RUNTIME="docker"
 INSTALL_AGENT="no"
+# Область установки: all — панель со всеми зависимостями,
+# game — только окружение игровых серверов.
+INSTALL_SCOPE="all"
 WITH_NGINX="yes"
 WITH_SSL="yes"
 SSL_EMAIL=""
@@ -291,12 +295,20 @@ parse_args() {
             --pma-path)      PHPMYADMIN_PATH="$2"; shift 2 ;;
             --pma-user)      PHPMYADMIN_USER="$2"; shift 2 ;;
             --pma-allow)     PHPMYADMIN_ALLOW="$2"; shift 2 ;;
+            --only)           INSTALL_SCOPE="$2"; shift 2 ;;
             --menu|-m)       SHOW_MENU="yes"; shift ;;
             --yes|-y)        INTERACTIVE=0; shift ;;
             --help|-h)       show_help; exit 0 ;;
             *) fail "Неизвестный параметр: $1 (см. --help)" ;;
         esac
     done
+
+    # Область установки: all — весь набор, game — только игровое окружение.
+    # Вторую выбирает пункт меню «Игровое окружение».
+    case "${INSTALL_SCOPE:-all}" in
+        all|game) INSTALL_SCOPE="${INSTALL_SCOPE:-all}" ;;
+        *) fail "Неизвестная область --only «$INSTALL_SCOPE». Допустимо: all, game" ;;
+    esac
 }
 
 show_help() {
@@ -328,6 +340,10 @@ GameDock — установщик панели управления игровы
   --node-major <N>        Старшая версия Node.js для агента (по умолчанию 20)
   --queue-workers <N>     Количество процессов очереди (по умолчанию 2)
   --dir <путь>            Каталог установки (по умолчанию /opt/gamedock)
+  --only <область>        all (по умолчанию) | game
+                         game — только окружение игровых серверов
+                         (Java, SteamCMD, сборочные пакеты), без панели,
+                         PHP, базы и nginx. То же, что пункт 3 меню.
 
 phpMyAdmin (веб-доступ к базам MySQL/MariaDB):
   --no-phpmyadmin         Не ставить phpMyAdmin
@@ -338,8 +354,20 @@ phpMyAdmin (веб-доступ к базам MySQL/MariaDB):
                          установщик создаёт и печатает в конце.
   -y, --yes               Без диалога, все ответы по умолчанию
 
+Меню:
+  Запуск без параметров открывает меню. Внутри:
+    1 Веб-сервер и база     5 Telegram-бот         9 Обновить панель
+    2 Панель GameDock       6 phpMyAdmin           A Установить всё
+    3 Игровое окружение     7 Службы и бэкапы     0 Выход
+    4 Агент ноды            8 Диагностика и статус
+  --menu, -m               Открыть меню принудительно
+  Из пункта меню запускается линейная установка, а не меню заново.
+
 Пример (полностью автоматически):
   sudo ./install.sh --domain panel.example.com --email me@example.com --with-agent -y
+
+Пример (только игровая нода, без панели):
+  sudo ./install.sh --only game -y
 
 Если ОС не поддерживается, поставьте панель через docker compose:
   docker compose up -d
@@ -1128,14 +1156,27 @@ resolve_php_version() {
 }
 
 install_packages() {
+    # Область установки:
+    #   all  (по умолчанию) — полный набор для панели: PHP, база, Redis, nginx;
+    #   game                 — только окружение игровых серверов.
+    #
+    # Область game нужна пункту меню «Игровое окружение»: раньше он только
+    # предупреждал «отдельная установка не поддерживается» и требовал сначала
+    # поставить панель целиком. Теперь игровой стек ставится сам по себе.
+    local scope="${1:-all}"
+
     step "Устанавливаю системные пакеты"
 
     export DEBIAN_FRONTEND=noninteractive
 
-    resolve_php_version
-    enable_apt_components
-    setup_sury_php
-    setup_nodejs_repo
+    # Репозиторий PHP и Node.js нужен только панели и агенту. Для игрового
+    # окружения подключать packages.sury.org незачем.
+    if [[ $scope == "all" ]]; then
+        resolve_php_version
+        enable_apt_components
+        setup_sury_php
+        setup_nodejs_repo
+    fi
 
     # Базовое
     local -a base=(
@@ -1158,21 +1199,26 @@ install_packages() {
     # php8.3-fpm, php8.3-cli. Без точки (php83-fpm) таких пакетов нет.
     # Раньше здесь была подстановка ${PHP_VERSION/./}, из-за чего все
     # PHP-пакеты молча уходили в «не найдены» и установка падала позже.
-    local ext
-    for ext in fpm cli mysql mbstring xml curl zip gd bcmath intl opcache soap redis; do
-        base+=("$(php_pkg "$ext")")
-    done
+    # Расширения PHP и сама PHP — только для панели. В области game их не
+    # тянем: играм PHP не нужен, а setup_sury_php выше пропущен, поэтому
+    # php_pkg вернул бы пустые имена пакетов.
+    if [[ $scope == "all" ]]; then
+        local ext
+        for ext in fpm cli mysql mbstring xml curl zip gd bcmath intl opcache soap redis; do
+            base+=("$(php_pkg "$ext")")
+        done
 
-    # База данных и Redis
-    if [[ $INSTALL_DB == "mysql" ]]; then
-        base+=(mariadb-server mariadb-client)
+        # База данных и Redis
+        if [[ $INSTALL_DB == "mysql" ]]; then
+            base+=(mariadb-server mariadb-client)
+        fi
+
+        if [[ $INSTALL_REDIS == "yes" ]]; then
+            base+=(redis-server redis-tools)
+        fi
     fi
 
-    if [[ $INSTALL_REDIS == "yes" ]]; then
-        base+=(redis-server redis-tools)
-    fi
-
-    # Node.js — агенту
+    # Node.js — агенту и Telegram-боту. Обоим в любой области.
     base+=(nodejs)
 
     # Всё для игр
@@ -1221,7 +1267,7 @@ install_packages() {
     fi
 
     # nginx и сертификаты
-    if [[ $WITH_NGINX == "yes" ]]; then
+    if [[ $WITH_NGINX == "yes" && $scope == "all" ]]; then
         base+=(nginx certbot python3-certbot-nginx)
     fi
 
@@ -1258,9 +1304,15 @@ install_packages() {
         fail "apt-get install не удался. Подробности: $LOG_FILE"
     fi
 
-    install_composer
+    if [[ $scope == "all" ]]; then
+        install_composer
+    fi
 
-    ok "Пакеты установлены"
+    if [[ $scope == "all" ]]; then
+        ok "Пакеты установлены"
+    else
+        ok "Игровое окружение установлено"
+    fi
 }
 
 # Скачать файл с повторами.
@@ -2764,6 +2816,33 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
+    # Telegram-бот. Токен и адрес панели лежат в /etc/gamedock/bot.env, его
+    # создаёт install_bot. Сам юнит создаётся здесь, а включается уже там:
+    # без токена бот стартует и сразу уходит в рестарт по кругу, поэтому
+    # включать его можно только после того, как файл с настройками готов.
+    cat >/etc/systemd/system/gamedock-bot.service <<EOF
+[Unit]
+Description=GameDock Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+WorkingDirectory=${BOT_DIR}
+EnvironmentFile=-/etc/gamedock/bot.env
+ExecStart=/usr/bin/node ${BOT_DIR}/src/index.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gamedock-bot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     # Целевой юнит для управления вместе
     cat >/etc/systemd/system/gamedock.target <<'EOF'
 [Unit]
@@ -3494,6 +3573,16 @@ agent_installed() {
     [[ -f "$AGENT_DIR/bin/gamedock-agent.js" ]] || have_cmd gamedock-agent
 }
 
+# Бот считается установленным, если развёрнут и запущен: файла мало —
+# без работающего юнита он просто лежит на диске.
+bot_installed() {
+    [[ -f "$BOT_DIR/src/index.js" ]]
+}
+
+bot_running() {
+    systemctl is-active --quiet gamedock-bot.service 2>/dev/null
+}
+
 # База данных?
 database_installed() {
     have_cmd mariadb || have_cmd mysql
@@ -3783,12 +3872,13 @@ install_game_stack() {
 
     cat <<'STACKEOF'
 Будут поставлены компоненты, нужные серверам:
-  • Java 17 (+ 21, если доступна)     — Minecraft, CS2, Rust, Unturned
-  • SteamCMD                          — CS2, Rust, Unturned, ARK
-  • build-essential и заголовки       — нативная сборка CRMP/RAGEMP/ALTV
-  • screen, tmux                      — фоновые процессы
-  • cgroups v2                        — только для рантайма native
+  • Java (17 или 21 — какая доступна)  — Minecraft, CS2, Rust, Unturned
+  • SteamCMD                           — CS2, Rust, Unturned, ARK
+  • build-essential, cmake, pkg-config — нативная сборка CRMP/RAGEMP/ALTV
+  • libssl-dev, libcurl4, libicu, SDL2 — заголовки для сборок модов
+  • screen, tmux, cron                 — фоновые процессы и расписания
 
+Панель, PHP, базу и nginx этот пункт НЕ трогает — только игровую часть.
 Запустить установку? [Y/n]
 STACKEOF
 
@@ -3798,17 +3888,294 @@ STACKEOF
         return 0
     fi
 
-    if have_cmd java; then
-        ok "Java уже стоит: $(java -version 2>&1 | head -1)"
+    # Отдельная линейная установка с областью game. Раньше здесь стояло
+    # предупреждение «отдельная установка пока не поддерживается», из-за
+    # чего пункт меню был по сути заглушкой.
+    run_install --only game-stack "$@"
+}
+
+# ── phpMyAdmin отдельным пунктом ─────────────────────────────────────
+#
+# install_phpmyadmin вызывается при установке веб-сервера и панели. Отдельного
+# пункта не было: переустановить phpMyAdmin или перевыпустить пароль, не
+# ставя панель заново, было нечем.
+install_phpmyadmin_menu() {
+    step "phpMyAdmin"
+
+    if ! webserver_installed; then
+        err "phpMyAdmin публикуется через nginx, а он не установлен"
+        warn "Сначала выполните пункт 1 — Веб-сервер и база"
+        pause
+        return 1
     fi
 
-    if have_cmd steamcmd || [[ -x /usr/games/steamcmd/steamcmd ]]; then
-        ok "SteamCMD уже стоит"
+    local current="/usr/share/phpmyadmin/index.php"
+    if [[ -f $current ]]; then
+        ok "phpMyAdmin уже установлен"
+    else
+        info "Пакета нет — он будет поставлен из репозитория дистрибутива"
     fi
 
-    info "Компоненты ставятся вместе с панелью (пункт 2)."
-    warn "Отдельная установка без панели пока не поддерживается."
+    if [[ -f $PHPMYADMIN_CREDS ]]; then
+        info "Текущие учётные данные лежат в $PHPMYADMIN_CREDS:"
+        sed 's/^/    /' "$PHPMYADMIN_CREDS"
+        echo
+    fi
+
+    cat <<'PMAEOF'
+Что сделать:
+  1 — поставить заново и перевыпустить пароль
+  2 — только показать текущие учётные данные (если они сохранены)
+  3 — выключить (убрать конфиг из nginx)
+  0 — назад
+PMAEOF
+
+    local choice
+    choice="$(read_choice "Что делаем с phpMyAdmin?")" || {
+        pause
+        return 0
+    }
+    echo
+
+    case "$choice" in
+        1)
+            # Флаг снимаем, иначе install_phpmyadmin откажется работать
+            # (он проверяет WITH_PHPMYADMIN) и опубликует заглушку.
+            WITH_PHPMYADMIN="yes"
+
+            if [[ -f $PHPMYADMIN_CREDS ]]; then
+                cp -a "$PHPMYADMIN_CREDS" "${PHPMYADMIN_CREDS}.bak.$(date +%s)" 2>/dev/null || true
+            fi
+
+            install_phpmyadmin
+
+            systemctl reload nginx 2>/dev/null || nginx -t && systemctl reload nginx 2>/dev/null || true
+
+            if [[ -f $PHPMYADMIN_CREDS ]]; then
+                echo
+                ok "Новые учётные данные:"
+                sed 's/^/    /' "$PHPMYADMIN_CREDS"
+            fi
+            pause
+            ;;
+        2)
+            if [[ -f $PHPMYADMIN_CREDS ]]; then
+                cat "$PHPMYADMIN_CREDS"
+            else
+                warn "Сохранённых учётных данных нет: $PHPMYADMIN_CREDS не найден"
+                info "Их можно посмотреть и в /etc/nginx/.htpasswd-gamedock"
+            fi
+            pause
+            ;;
+        3)
+            rm -f "$PHPMYADMIN_SNIPPET"
+            if grep -rq "$PHPMYADMIN_SNIPPET" /etc/nginx/sites-enabled/ 2>/dev/null; then
+                warn "Ссылка на сниппет есть в конфигах сайтов — уберу и их"
+                grep -rl "$PHPMYADMIN_SNIPPET" /etc/nginx/sites-enabled/ 2>/dev/null | while read -r f; do
+                    rm -f "$f"
+                    log "удалён $f"
+                done
+            fi
+            if nginx -t 2>/dev/null; then
+                systemctl reload nginx 2>/dev/null || true
+                ok "phpMyAdmin больше не публикуется"
+            else
+                err "Конфиг nginx не проходит проверку — смотрите nginx -t"
+            fi
+            pause
+            ;;
+        0|"") ;;
+        *) warn "Нет пункта «$choice»" ; pause ;;
+    esac
+}
+
+# ── Обновление панели ───────────────────────────────────────────────
+#
+# Выбранный способ обновления у друзей: пункт меню. Раньше обновления в
+# установщике не было вовсе — ни git pull, ни composer install, ни artisan
+# optimize. Повторный запуск установщика переустанавливал панель поверх
+# себя и перетирал настройки, поэтому обновлять было нечем.
+update_panel() {
+    step "Обновление панели"
+
+    if ! panel_installed; then
+        err "Панель не найна в $PANEL_DIR"
+        warn "Сначала установите её: пункт 2 — Панель GameDock"
+        pause
+        return 1
+    fi
+
+    echo
+    info "Что будет сделано:"
+    echo "  1. Резервная копия .env и текущего кода в $STATE_DIR/backup"
+    echo "  2. Обновление PHP-зависимостей (composer)"
+    echo "  3. Сборка фронтенда (vite)"
+    echo "  4. Миграции базы"
+    echo "  5. Очистка и прогрев кеша Laravel"
+    echo "  6. Перезапуск служб"
+    echo
+    warn "Ваши данные (база, .env, файлы игр) не затрагиваются"
+    echo
+
+    if ! confirm "Обновляем панель?" "y"; then
+        info "Отменено"
+        pause
+        return 0
+    fi
+
+    # ── 1. Резервная копия ────────────────────────────────────────
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    local backup_dir="$STATE_DIR/backup/panel-$stamp"
+
+    info "Делаю резервную копию в $backup_dir"
+    mkdir -p "$backup_dir"
+    cp -a "$PANEL_DIR/.env" "$backup_dir/.env" 2>/dev/null || true
+
+    local before
+    before="$(cd "$PANEL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "")"
+    [[ -n $before ]] && printf '%s\n' "$before" >"$backup_dir/.revision"
+
+    if [[ -d "$REPO_DIR/panel" ]]; then
+        cp -a "$PANEL_DIR" "$backup_dir/panel" 2>/dev/null || true
+    fi
+    ok "Копия готова"
+
+    # ── 2. Код ────────────────────────────────────────────────────
+    # Три источника, по убыванию предпочтительности. Первый, кто есть, —
+    # и есть источник обновления; остальные не трогаем.
+    if [[ -d "$REPO_DIR/panel/.git" ]]; then
+        info "Обновляю код через git в $REPO_DIR"
+        (
+            cd "$REPO_DIR" || exit 1
+            git fetch --quiet origin "$GAMEDOCK_BRANCH" 2>/dev/null || git fetch --quiet origin
+            git checkout --quiet "$GAMEDOCK_BRANCH" 2>/dev/null || true
+            git pull --quiet --ff-only origin "$GAMEDOCK_BRANCH" 2>&1 || git pull --quiet --ff-only 2>&1
+        ) | tail -5
+    elif [[ -d "$PANEL_DIR/.git" ]]; then
+        info "Обновляю код через git в $PANEL_DIR"
+        (
+            cd "$PANEL_DIR" || exit 1
+            git fetch --quiet origin "$GAMEDOCK_BRANCH" 2>/dev/null || git fetch --quiet origin
+            git pull --quiet --ff-only origin "$GAMEDOCK_BRANCH" 2>&1 || git pull --quiet --ff-only 2>&1
+        ) | tail -5
+    else
+        warn "Git-репозитория нет — код панели останется прежним"
+        info "Обновится только PHP- и JS-зависимости"
+    fi
+
+    local after
+    after="$(cd "$PANEL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "")"
+    if [[ -n $before && -n $after ]]; then
+        if [[ $before == "$after" ]]; then
+            info "Код не изменился (остался $after)"
+        else
+            ok "Код обновлён: $before → $after"
+        fi
+    fi
+
+    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$PANEL_DIR"
+
+    # ── 3. Зависимости ────────────────────────────────────────────
+    log "Ставлю PHP-зависимости…"
+    # Права на каталог composer нужны, иначе от пользователя gamedock
+    # он не сможет ни прочитать кеш, ни записать в vendor.
+    mkdir -p "$PANEL_DIR/storage/framework/cache" "$PANEL_DIR/bootstrap/cache"
+    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$PANEL_DIR/bootstrap/cache" "$PANEL_DIR/storage" 2>/dev/null || true
+
+    if [[ -f "$PANEL_DIR/composer.json" ]]; then
+        if ! run_as_panel "composer install --no-dev --optimize-autoloader --no-interaction 2>&1" | tail -8; then
+            warn "composer install не отработал — проверьте сети и composer.lock"
+        fi
+    else
+        warn "composer.json не найден — зависимости не трогаю"
+    fi
+
+    log "Собираю фронтенд…"
+    if [[ -f "$PANEL_DIR/package.json" ]]; then
+        local npm_install="npm ci"
+        if [[ ! -f "$PANEL_DIR/package-lock.json" ]]; then
+            # npm ci требует package-lock.json и без него просто падает.
+            npm_install="npm install"
+            warn "package-lock.json нет — ставлю через npm install вместо npm ci"
+        fi
+
+        run_as_panel "$npm_install --omit=optional 2>&1" | tail -5 || true
+        if ! run_as_panel "npm run build 2>&1" | tail -8; then
+            warn "Сборка фронтенда не удалась — публичные файлы останутся прежними"
+            info "Панель при этом работает, но изменения в интерфейсе не появятся"
+        fi
+    else
+        warn "package.json не найден — фронтенд не собираю"
+    fi
+
+    # ── 4. Миграции ───────────────────────────────────────────────
+    # Сначала снимаем кеш конфигурации: с закэшированным config миграции
+    # читали бы старые настройки и могли пройти не по тому пути.
+    log "Чищу кеш Laravel…"
+    run_as_panel "php artisan config:clear 2>&1" | tail -3 || true
+    run_as_panel "php artisan route:clear 2>&1" | tail -3 || true
+    run_as_panel "php artisan view:clear 2>&1" | tail -3 || true
+
+    log "Выполняю миграции…"
+    if run_as_panel "php artisan migrate --force --no-interaction 2>&1" | tail -15; then
+        ok "Миграции выполнены"
+    else
+        err "Миграции не прошли"
+        warn "Панель может работать неправильно. Что делать:"
+        warn "  посмотреть ошибки:  cd $PANEL_DIR && php artisan migrate --force"
+        warn "  вернуть старую версию: cp -a $backup_dir/panel/. $PANEL_DIR/"
+        warn "  и повторить миграции"
+        pause
+        return 1
+    fi
+
+    # ── 5. storage:link ───────────────────────────────────────────
+    # Повторный вызов падал с «The [public/storage] link already exists»,
+    # поэтому проверяем заранее.
+    if [[ ! -e "$PANEL_DIR/public/storage" ]]; then
+        run_as_panel "php artisan storage:link 2>&1" | tail -3 || true
+    else
+        log "public/storage уже связан — пропускаю"
+    fi
+
+    # ── 6. Кеш и перезапуск ───────────────────────────────────────
+    run_as_panel "php artisan config:cache 2>&1" | tail -3 || warn "config:cache не удался"
+    run_as_panel "php artisan route:cache 2>&1" | tail -3 || warn "route:cache не удался"
+    run_as_panel "php artisan view:cache 2>&1" | tail -3 || warn "view:cache не удался"
+
+    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$PANEL_DIR/bootstrap/cache" 2>/dev/null || true
+
+    log "Перезапускаю службы…"
+    for svc in gamedock-wss.service gamedock-scheduler.service; do
+        if systemctl list-unit-files "$svc" >/dev/null 2>&1; then
+            systemctl restart "$svc" >/dev/null 2>&1 || warn "Не удалось перезапустить $svc"
+        fi
+    done
+    systemctl try-restart 'gamedock-queue@*.service' >/dev/null 2>&1 || true
+
+    sleep 1
+
+    # ── 7. Итог ───────────────────────────────────────────────────
+    echo
+    if check_url "https://${PANEL_DOMAIN}"; then
+        ok "Панель обновлена и отвечает"
+    else
+        warn "Панель обновлена, но https://${PANEL_DOMAIN} не отвечает"
+        info "Журналы: journalctl -u gamedock-wss -n 50"
+        info "Откат: cp -a $backup_dir/panel/. $PANEL_DIR/"
+    fi
+
+    info "Резервная копия: $backup_dir"
     pause
+}
+
+# Команда от пользователя gamedock в каталоге панели.
+#
+# su -s /bin/bash не даёт cd «снаружи», поэтому путь и каталог передаются
+# через саму команду. Вывод не буферизуем — пайп в вызывающем коде.
+run_as_panel() {
+    su -s /bin/bash "$SERVICE_USER" -c "cd '$PANEL_DIR' && $*"
 }
 
 # ── Пункт 4. Агент ноды ──────────────────────────────────────────────
@@ -3827,6 +4194,195 @@ install_node_agent() {
     echo
 
     run_agent "$@"
+}
+
+# ── Telegram-бот ─────────────────────────────────────────────────────
+#
+# Раньше установщик только спрашивал токен бота и записывал его в .env панели
+# как GD_TELEGRAM_BOT_TOKEN. Сам бот при этом никуда не копировался, systemd-юнит
+# не создавался: из каталога bot/ на сервере не появлялось ничего, и бот,
+# купленный в панели как готовый, просто не работал.
+
+install_bot() {
+    step "Telegram-бот"
+
+    # ── 1. Предусловия ────────────────────────────────────────────
+    if ! have_cmd node; then
+        warn "Node.js не найден — боту нужен Node ≥ 20"
+        if ! confirm "Поставить Node.js сейчас?" "y"; then
+            info "Пропускаю бота"
+            pause
+            return 1
+        fi
+        apt_update
+        if ! run_logged 5 apt-get install -y -qq nodejs; then
+            fail "Не удалось поставить Node.js"
+        fi
+    fi
+
+    local node_major
+    node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+    if (( node_major < 20 )); then
+        warn "Node.js ${node_major} — боту нужен 20 или новее"
+    fi
+
+    # ── 2. Токен ──────────────────────────────────────────────────
+    local token="" chats=""
+
+    if bot_installed; then
+        ok "Бот уже развёрнут в $BOT_DIR"
+    fi
+
+    # Пробуем взять токен из панели: бот должен работать с тем же
+    # Telegram-аккаунтом, что и уведомления, иначе получится два бота.
+    if [[ -f "$PANEL_DIR/.env" ]]; then
+        local from_env
+        from_env="$(grep -E '^GD_TELEGRAM_BOT_TOKEN=' "$PANEL_DIR/.env" 2>/dev/null \
+            | head -1 | cut -d= -f2- | tr -d '"'"'" | sed 's/^ *//;s/ *$//')"
+
+        if [[ -n $from_env ]]; then
+            info "В панели уже задан токен бота: ${from_env:0:12}…"
+            if confirm "Использовать его?" "y"; then
+                token="$from_env"
+            fi
+        fi
+    fi
+
+    if [[ -z $token ]]; then
+        echo
+        info "Свой токен берётся у @BotFather: /newbot"
+        token="$(ask "Токен бота (оставьте пустым — поставим без токена)" "")"
+        token="${token#"${token%%[![:space:]]*}"}"   # снять пробелы
+        token="${token%"${token##*[![:space:]]}"}"
+    fi
+
+    if [[ -z $token ]]; then
+        warn "Без токена бот не сможет подключиться к Telegram"
+        warn "Поставлю файлы и юнит — токен потом можно вписать в /etc/gamedock/bot.env"
+    else
+        chats="$(ask "Ваш chat_id для админ-уведомлений (можно пропустить)" "$TELEGRAM_ADMIN_CHAT")"
+    fi
+
+    # ── 3. Разворачиваем файлы ────────────────────────────────────
+    if [[ ! -d "$REPO_DIR/bot" ]]; then
+        err "В репозитории нет каталога bot/ (искали в $REPO_DIR)"
+        info "Запустите пункт «Диагностика и статус» или перезапустите установщик с --yes"
+        pause
+        return 1
+    fi
+
+    info "Копирую бота в $BOT_DIR"
+    rm -rf "$BOT_DIR"
+    mkdir -p "$BOT_DIR"
+    if ! copy_tree "$REPO_DIR/bot" "$BOT_DIR" "Telegram-бот"; then
+        fail "Не удалось скопировать бота из $REPO_DIR/bot"
+    fi
+
+    # node_modules у бота нет — у него ноль зависимостей (см. bot/package.json),
+    # поэтому npm ci здесь не нужен. Проверяем только синтаксис точки входа.
+    if ! node --check "$BOT_DIR/src/index.js" 2>/dev/null; then
+        fail "Синтаксис $BOT_DIR/src/index.js не проходит проверку"
+    fi
+
+    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$BOT_DIR"
+
+    # ── 4. Файл настроек ──────────────────────────────────────────
+    install -d -m 0750 /etc/gamedock
+
+    local panel_url="https://${PANEL_DOMAIN}"
+    [[ -n $PANEL_DOMAIN ]] || panel_url="http://127.0.0.1:8000"
+
+    local admin_line=""
+    if [[ -n $chats ]]; then
+        # Бот ждёт список chat_id через запятую (GD_ADMIN_CHATS, csv),
+        # а человек вводит их с пробелами и запятыми. Приводим к запятым.
+        admin_line="GD_ADMIN_CHATS=$(printf '%s' "$chats" | tr ' ,' ',,' | tr -s ',' | sed 's/^,//;s/,$//')"
+    fi
+
+    cat >/etc/gamedock/bot.env <<BOTENVEOF
+# Настройки Telegram-бота GameDock.
+# Файл создан автоустановщиком $(date -u '+%Y-%m-%d %H:%M:%S') UTC.
+# Права: 0600, читает только служба gamedock-bot.
+TELEGRAM_BOT_TOKEN=${token}
+TELEGRAM_MODE=longPolling
+GD_PANEL_URL=${panel_url}
+${admin_line}
+GD_TZ=Europe/Moscow
+BOTENVEOF
+
+    # Токен — пароль. Файл читает systemd от root и подставляет в процесс
+    # от пользователя gamedock, поэтому 0600 достаточно, а 0644 утек бы
+    # любому, кто может зайти на сервер.
+    chmod 0600 /etc/gamedock/bot.env
+    chown root:"$SERVICE_GROUP" /etc/gamedock/bot.env 2>/dev/null || chown root:root /etc/gamedock/bot.env
+
+    # ── 5. Запуск ─────────────────────────────────────────────────
+    if [[ ! -f /etc/systemd/system/gamedock-bot.service ]]; then
+        warn "Юнит gamedock-bot.service не найден — создаю"
+        write_bot_unit
+    fi
+
+    systemctl daemon-reload
+
+    if [[ -z $token ]]; then
+        warn "Токена нет — юнит не включаю, иначе он будет рестартовать по кругу"
+        warn "Впишите токен в /etc/gamedock/bot.env и выполните:"
+        warn "  systemctl enable --now gamedock-bot.service"
+        pause
+        return 0
+    fi
+
+    systemctl enable gamedock-bot.service >/dev/null 2>&1 \
+        || warn "Не удалось включить бота в автозагрузку"
+    systemctl restart gamedock-bot.service \
+        || warn "systemctl restart не отработал — смотрите journalctl"
+
+    # ── 6. Проверка ───────────────────────────────────────────────
+    sleep 2
+    if bot_running; then
+        ok "Бот запущен"
+    else
+        warn "Бот не запустился. Последние строки журнала:"
+        journalctl -u gamedock-bot.service -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true
+        info "Проверить вручную: journalctl -u gamedock-bot -f"
+        pause
+        return 1
+    fi
+
+    echo
+    ok "Telegram-бот установлен"
+    info "Настройки: /etc/gamedock/bot.env"
+    info "Журнал:    journalctl -u gamedock-bot -f"
+    info "Остановить: systemctl stop gamedock-bot"
+    pause
+}
+
+# Юнит бота вынесен отдельно: его нужен и setup_systemd, и install_bot —
+# когда файл бота уже есть, а setup_systemd по какой-то причине не отработал.
+write_bot_unit() {
+    cat >/etc/systemd/system/gamedock-bot.service <<EOF
+[Unit]
+Description=GameDock Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+WorkingDirectory=${BOT_DIR}
+EnvironmentFile=-/etc/gamedock/bot.env
+ExecStart=/usr/bin/node ${BOT_DIR}/src/index.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gamedock-bot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 /etc/systemd/system/gamedock-bot.service
 }
 
 # ── Пункт 5. Меню CRON/BACKUP ────────────────────────────────────────
@@ -4017,6 +4573,58 @@ menu_services() {
     done
 }
 
+# ── Службы и бэкапы одним подменю ────────────────────────────────────
+#
+# Раньше это были два отдельных пункта главного меню (CRON/BACKUP и СЛУЖБЫ),
+# из-за чего список разрастался. Соединили в одно подменю: логика пунктов
+# та же, переиспользуем те же функции.
+menu_ops() {
+    local choice
+
+    while true; do
+        banner "СЛУЖБЫ и БЭКАПЫ"
+        printf '%s   Панель: %s   Агент: %s   Бот: %s%s\n\n' \
+            "$CYAN" \
+            "$(panel_installed && echo 'установлена' || echo 'нет')" \
+            "$(agent_installed && echo 'есть' || echo 'нет')" \
+            "$(bot_installed && echo 'есть' || echo 'нет')" \
+            "$NC"
+
+        printf '%s   — Службы —%s\n' "$BOLD" "$NC"
+        menu_item 1 "$CYAN" "Показать состояние служб"
+        menu_item 2 "$CYAN" "Запустить / остановить / перезапустить"
+        menu_item 3 "$CYAN" "Живые логи (следить)"
+
+        printf '\n%s   — Планировщик и бэкапы —%s\n' "$BOLD" "$NC"
+        menu_item 4 "$CYAN" "Статус планировщика (биллинг, автосъём, бэкапы)"
+        menu_item 5 "$CYAN" "Запустить планировщик сейчас (разово)"
+        menu_item 6 "$CYAN" "Показать последние бэкапы"
+        menu_item 7 "$CYAN" "Проверить ротацию логов"
+
+        printf '\n'
+        menu_item 0 "$YELLOW" "Вернуться в меню"
+        menu_footer "СЛУЖБЫ / БЭКАПЫ"
+
+        choice="$(read_choice)" || return 0
+        echo
+
+        case "$choice" in
+            1) services_overview ;;
+            2) services_action pick ;;
+            3) services_follow ;;
+            4) cron_status ;;
+            5) cron_run_now ;;
+            6) backups_list ;;
+            7) logs_rotation ;;
+            0) return 0 ;;
+            "") return 0 ;;
+            *) warn "Нет пункта «$choice»" ;;
+        esac
+
+        pause
+    done
+}
+
 # Печатает по строке на службу: имя + состояние цветом
 services_overview() {
     local svc state color
@@ -4044,6 +4652,35 @@ services_overview() {
 
 services_action() {
     local action="$1" svc ok_count=0
+
+    # Режим pick: спрашиваем действие сами. В пункте 2 объединённого
+    # подменю стоит именно он, чтобы не тащить туда три отдельных пункта.
+    if [[ $action == "pick" ]]; then
+        echo
+        printf '%s   Что сделать со службами?%s\n' "$BOLD" "$NC"
+        menu_item 1 "$CYAN" "Запустить все службы"
+        menu_item 2 "$CYAN" "Остановить все службы"
+        menu_item 3 "$CYAN" "Перезапустить все службы"
+        menu_item 0 "$YELLOW" "Назад"
+        menu_footer "СЛУЖБЫ"
+
+        local picked
+        picked="$(read_choice "Выберите действие")" || return 0
+        echo
+
+        case "$picked" in
+            1) action="start" ;;
+            2) action="stop" ;;
+            3) action="restart" ;;
+            0|"") info "Отменено" ; return 0 ;;
+            *) warn "Нет пункта «$picked»" ; return 0 ;;
+        esac
+    fi
+
+    case "$action" in
+        start|stop|restart) ;;
+        *) fail "Неизвестное действие над службами: $action" ;;
+    esac
 
     step "Службы: $action"
 
@@ -4225,9 +4862,13 @@ install_all() {
   4. nginx-виртуал + сертификат Let's Encrypt
   5. Службы: WSS, очереди, планировщик
   6. Агент ноды на этой же машине
+  7. phpMyAdmin под паролем
 
 Это тот же путь, что и пункт 1 → пункт 2, только без лишних вопросов.
 Меня вы спросите домен и почту.
+
+Telegram-бот сюда не входит: для него нужен токен от @BotFather, а в этом
+режиме вопросов нет. Поставить бота — пункт 5 главного меню.
 
 Продолжить? [y/N]
 ALLEOF
@@ -4248,27 +4889,38 @@ main_menu() {
 
     while true; do
         # Свежий список того, что уже есть, — пункты подсвечиваются.
-        local web_mark="" panel_mark="" agent_mark=""
-        webserver_installed  && web_mark="[уже стоит]"
-        panel_installed      && panel_mark="[уже стоит]"
-        agent_installed      && agent_mark="[уже стоит]"
+        local web_mark="" panel_mark="" agent_mark="" bot_mark="" pma_mark=""
+        webserver_installed && web_mark="[уже стоит]"
+        panel_installed     && panel_mark="[уже стоит]"
+        agent_installed     && agent_mark="[уже стоит]"
+        bot_installed       && bot_mark="[уже стоит]"
+        [[ -f /usr/share/phpmyadmin/index.php ]] && pma_mark="[уже стоит]"
 
-        banner "Добро пожаловать в меню автоустановщика GameDock ${GAMEDOCK_VERSION}!"
-        printf '%s   Панель: %s   Веб: %s   Агент: %s%s\n\n' \
+        banner "GameDock ${GAMEDOCK_VERSION} — установка игрового хостинга"
+
+        printf '%s   Панель: %-14s Веб: %-9s Агент: %-8s Бот: %s%s\n\n' \
             "$CYAN" \
             "$(panel_installed && echo 'установлена' || echo 'нет')" \
             "$(webserver_installed && echo "$(webserver_name)" || echo 'нет')" \
             "$(agent_installed && echo 'есть' || echo 'нет')" \
+            "$(bot_installed && echo 'есть' || echo 'нет')" \
             "$NC"
 
-        menu_item 1 "$MAGENTA" "Настроить VDS/VPS под WEB Server (LAMP) для панели!" "$web_mark"
-        menu_item 2 "$GREEN"    "Установка панели хостинга GameDock!" "$panel_mark"
-        menu_item 3 "$CYAN"     "Настроить VDS/VPS под игровые серверы (Java, SteamCMD)!"
-        menu_item 4 "$BLUE"     "Установить/обновить агента ноды!" "$agent_mark"
-        menu_item 5 "$YELLOW"   "Открыть меню CRON/BACKUP!"
-        menu_item 6 "$YELLOW"   "Открыть меню СЛУЖБЫ!"
-        menu_item 7 "$YELLOW"   "Открыть меню СОСТОЯНИЕ!"
-        menu_item 8 "$BOLD$GREEN" "Установить ВСЁ в один клик (панель + агент)!"
+        printf '%s   — Установка —%s\n' "$BOLD" "$NC"
+        menu_item 1 "$MAGENTA" "Веб-сервер и база (nginx, PHP-FPM, MariaDB, Redis)" "$web_mark"
+        menu_item 2 "$GREEN"    "Панель GameDock (код, база, nginx, сертификат)" "$panel_mark"
+        menu_item 3 "$CYAN"     "Игровое окружение (Java, SteamCMD, сборочные пакеты)"
+        menu_item 4 "$BLUE"     "Агент ноды (управление игровыми серверами)" "$agent_mark"
+        menu_item 5 "$CYAN"     "Telegram-бот (уведомления, оплата, управление)" "$bot_mark"
+
+        printf '\n%s   — Обслуживание —%s\n' "$BOLD" "$NC"
+        menu_item 6 "$YELLOW"   "phpMyAdmin (веб-доступ к базам)" "$pma_mark"
+        menu_item 7 "$YELLOW"   "Службы и бэкапы (CRON, бэкапы, логи)"
+        menu_item 8 "$YELLOW"   "Диагностика и статус"
+        menu_item 9 "$GREEN"    "Обновить панель (код, зависимости, миграции)"
+
+        printf '\n'
+        menu_item A "$BOLD$GREEN" "Установить ВСЁ в один клик (панель + агент + бот)"
         menu_item 0 "$RED"      "Выход"
         menu_footer "GAMEDOCK"
 
@@ -4278,6 +4930,8 @@ main_menu() {
             info "Для автоматической установки: bash deploy/install.sh --yes"
             return 0
         }
+        # Приводим к нижнему регистру: пункт «A» набирают и как «a».
+        choice="${choice,,}"
         echo
 
         case "$choice" in
@@ -4285,13 +4939,15 @@ main_menu() {
             2) install_panel ;;
             3) install_game_stack ;;
             4) install_node_agent ;;
-            5) menu_cron_backup ;;
-            6) menu_services ;;
-            7) menu_status ;;
-            8) install_all ;;
+            5) install_bot ;;
+            6) install_phpmyadmin_menu ;;
+            7) menu_ops ;;
+            8) menu_status ;;
+            9) update_panel ;;
+            a) install_all ;;
             0) banner "Пока!"; return 0 ;;
             "") ;;   # просто Enter — остаёмся в меню
-            *) warn "Нет пункта «$choice». Введите число от 0 до 8." ;;
+            *) warn "Нет пункта «$choice». Введите число от 0 до 9 или A." ;;
         esac
     done
 }
@@ -4361,6 +5017,45 @@ main() {
     ensure_base_tools
     check_deps
     preflight_dependencies
+
+    # ── Область game: только игровое окружение ──────────────────
+    # Дальше идёт диалог панели, домен, оплата и сама панель — всё это
+    # окружению игр не нужно. Поэтому выходим сразу после пакетов: панель,
+    # PHP, базу и nginx этот режим не трогает.
+    if [[ $INSTALL_SCOPE == "game" ]]; then
+        step "Окружение для игровых серверов"
+
+        install_packages game
+        ensure_cgroup_v2 || warn "cgroup v2 не настроен — рантайм native работать не будет"
+
+        install -d -m 0750 "$INSTALL_DIR/servers" "$INSTALL_DIR/backups" 2>/dev/null || true
+
+        echo
+        if have_cmd java; then
+            ok "Java: $(java -version 2>&1 | head -1)"
+        else
+            warn "Java не найдена — Minecraft, CS2 и Rust не запустятся"
+        fi
+
+        if have_cmd steamcmd || [[ -x /usr/games/steamcmd/steamcmd ]]; then
+            ok "SteamCMD на месте"
+        else
+            warn "SteamCMD нет — он нужен для CS2, Rust, Unturned и ARK"
+            warn "  Поставить вручную:"
+            warn "    mkdir -p /usr/games/steamcmd && \\"
+            warn "    curl -sL https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \\"
+            warn "    | tar -xz -C /usr/games/steamcmd"
+            warn "  Либо запускайте эти игры в контейнерах (рантайм docker)"
+        fi
+
+        have_cmd screen && ok "screen на месте" || warn "screen нет — фоновые процессы работать не будут"
+        have_cmd tmux   && ok "tmux на месте"   || warn "tmux нет"
+
+        echo
+        ok "Игровое окружение готово"
+        info "Панель на этом сервере не ставилась — это нормально для игровой ноды"
+        return 0
+    fi
 
     # ── Диалог ─────────────────────────────────────────────────────
     step "Настройка панели"
