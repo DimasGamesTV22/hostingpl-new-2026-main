@@ -500,9 +500,13 @@ enable_apt_components() {
     apt-get update -qq || warn "Часть репозиториев не обновилась — продолжаю с имеющимися индексами"
 }
 
+# LC_ALL=C обязателен: вывод apt локализован, и на русской локаль
+# строка «Candidate:» приходит как «Кандидат:», а «(none)» — как
+# «(отсутствует)». Без LC_ALL=C awk не находил кандидата ни для одного
+# пакета, и агент считал недоступными даже заведомо базовые вещи.
 pkg_available() {
     local candidate
-    candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    candidate="$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
     [[ -n $candidate && $candidate != "(none)" ]]
 }
 

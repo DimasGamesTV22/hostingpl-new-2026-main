@@ -959,9 +959,16 @@ enable_apt_components() {
 # `apt-cache show` отвечает «есть» и для пакета, который в индексе есть, но
 # установить его нельзя: на Debian 13 openjdk-17-jre-headless и steamcmd именно
 # такие — строки в индексе есть, а Candidate: (none). Проверяем кандидата.
+#
+# LC_ALL=C обязателен. Вывод apt локализован: в apt-private/private-show.cc
+# строка «  Candidate: » переведена в ru.po как «  Кандидат: », а «(none)» —
+# как «(отсутствует)». На сервере с русской локалью awk не находил Candidate:
+# вообще, и pkg_available возвращал false для ЛЮБОГО пакета — включая curl и
+# git. Установщик доходил до «Ни один пакет не найден — проверьте репозитории»
+# при полностью рабочих репозиториях.
 pkg_available() {
     local candidate
-    candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    candidate="$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
     [[ -n $candidate && $candidate != "(none)" ]]
 }
 

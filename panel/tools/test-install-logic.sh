@@ -404,6 +404,67 @@ else
     t_bad "чистый файл не меняется и не получает бэкап" "файл изменён: $(cat "$TMP/clean.list")"
 fi
 
+# ── Локаль apt ─────────────────────────────────────────────────────────
+#
+# pkg_available разбирает вывод `apt-cache policy` по строке «Candidate:».
+# Но этот вывод переводится gettext'ом: в apt/po/ru.po рядом с
+# msgid "  Candidate: " стоит msgstr "  Кандидат: ", а с «(none)» —
+# «(отсутствует)».
+#
+# На сервере с русской локалью awk не находил ничего, и pkg_available
+# возвращал false для ЛЮБОГО пакета — даже для curl и git. Установщик
+# доходил до «Ни один пакет не найден — проверьте репозитории» при
+# полностью рабочих репозиториях, а steamcmd, ncurses и Java выглядели
+# недоступными наравне со всем остальным.
+
+head_ "pkg_available: локализованный вывод apt-cache"
+
+# apt-cache подменён: настоящего на машине разработки нет, а нужна именно
+# его РАСКЛАДКА вывода. Кандидат задаётся APT_STUB_CANDIDATE; пусто —
+# кандидата нет. С LC_ALL=C строки английские, без неё — русские.
+apt-cache() {
+    case "${LC_ALL:-}" in
+        C|C.UTF-8|POSIX)
+            printf '  Installed: (none)\n  Candidate: %s\n' "${APT_STUB_CANDIDATE:-(none)}"
+            ;;
+        *)
+            printf '  Установлен: (отсутствует)\n  Кандидат: %s\n' "${APT_STUB_CANDIDATE:-(отсутствует)}"
+            ;;
+    esac
+}
+
+# pkg_available здесь ещё настоящая, из install.sh: переопределяется она
+# ниже, в блоке php_pkg.
+#
+# $1 — кандидат (пусто = кандидата нет), $2 — пакет. LANG/LANG без C
+# должен быть снят: тест идёт в русской раскладке.
+pkg_available_in_ru_locale() {
+    (
+        unset LC_ALL LANG LANGUAGE
+        export APT_STUB_CANDIDATE="$1"
+        if pkg_available "$2"; then printf true; else printf false; fi
+    )
+}
+
+eq "русская локаль: пакет с кандидатом найден" \
+    "$(pkg_available_in_ru_locale 8.14.1 curl)" "true"
+eq "русская локаль: отсутствующий пакет не считается доступным" \
+    "$(pkg_available_in_ru_locale '' nosuchpkg)" "false"
+eq "английская локаль: обычный случай не сломан" \
+    "$( APT_STUB_CANDIDATE=8.14.1 LC_ALL=C pkg_available curl && printf true || printf false )" "true"
+
+unset -f apt-cache
+
+# LC_ALL=C обязателен в самой функции, а не только в тесте: иначе правка
+# откатится незаметно.
+for f in install.sh agent.sh; do
+    if grep -q 'LC_ALL=C apt-cache policy' "$ROOT/deploy/$f"; then
+        t_ok "$f: pkg_available принудительно ставит LC_ALL=C"
+    else
+        t_bad "$f: pkg_available принудительно ставит LC_ALL=C" "нет LC_ALL=C перед apt-cache"
+    fi
+done
+
 # ── Имена PHP-пакетов ─────────────────────────────────────────────────
 #
 # Пакеты PHP называются с точкой: php8.3-fpm. Раньше в списке apt-пакетов стояло
