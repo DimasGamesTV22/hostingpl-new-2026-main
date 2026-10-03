@@ -1,0 +1,47 @@
+# Переводы строк.
+#
+# Зачем: без этого файла переводы строк зависят от настроек каждого, кто
+# клонировал репозиторий. Из-за этого в одном файле оказывались и LF, и
+# CRLF, и markdown склеивался в одну строку — GitHub показывал его
+# нечитаемым, а «Блокнот» — «бинарным».
+#
+# Правила:
+#   * в репозитории храним LF (так работают все диффы и инструменты);
+#   * рабочую копию для Windows отдаём с CRLF — иначе «Блокнот»
+#     показывает файл одной строкой;
+#   * скрипты и конфиги всегда LF — CRLF в bash ломает запуск.
+
+* text=auto eol=lf
+
+# Скрипты: CRLF здесь означает «command not found» и странные ошибки парсинга
+*.sh text eol=lf
+bash text eol=lf
+
+# Документация: CRLF, чтобы «Блокнот» показывал нормальные переводы строк
+*.md text eol=crlf
+
+# Код панели и агента — всегда LF
+*.php text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.mjs text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.blade.php text eol=lf
+
+# Бинарное — не трогаем переводы строк
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary

@@ -301,6 +301,109 @@ else
     t_bad "файл без строк deb не трогаем" "файл изменён"
 fi
 
+# ── Отключение cdrom:/file:-репозиториев ────────────────────────────────
+# После установки с netinst-образа в sources.list остаётся строка
+# `deb cdrom:/[…] trixie main`. Сам ISO к серверу не подключён, и
+# `apt-get update` падает с «не содержит файла Release». Раньше установщик
+# на этом шаге умирал, хотя сеть и остальные репозитории были в порядке.
+
+head_ "sanitize_apt_sources"
+
+# Формат 1: классический sources.list с остатком установочного образа
+cat > "$TMP/cdrom.list" <<'EOF'
+# Debian
+deb cdrom:/[Debian GNU/Linux 13.7.0_Trixie - Official amd64 NETINST with firmware 20260912-09:35]/ trixie main
+deb http://deb.debian.org/debian trixie main
+deb http://security.debian.org/debian-security trixie-security main
+EOF
+
+sanitize_apt_sources "$TMP/cdrom.list"
+if grep -q '^# deb cdrom:/' "$TMP/cdrom.list"; then
+    t_ok "классический формат: строка cdrom закомментирована"
+else
+    t_bad "классический формат: строка cdrom закомментирована" "$(cat "$TMP/cdrom.list")"
+fi
+if grep -q '^deb http://deb.debian.org/debian trixie main$' "$TMP/cdrom.list" \
+   && grep -q '^deb http://security.debian.org/debian-security trixie-security main$' "$TMP/cdrom.list"; then
+    t_ok "классический формат: рабочие репозитории не тронуты"
+else
+    t_bad "классический формат: рабочие репозитории не тронуты" "$(cat "$TMP/cdrom.list")"
+fi
+# Соседние строки cdrom не должны уносить за собой живые репозитории:
+# в классическом формате блоками считать нечего, комментируем построчно.
+if [[ "$(grep -c '^#' "$TMP/cdrom.list")" == "2" ]]; then
+    t_ok "классический формат: закомменчена только строка cdrom"
+else
+    t_bad "классический формат: закомменчена только строка cdrom" "комментариев: $(grep -c '^#' "$TMP/cdrom.list")"
+fi
+
+# Формат 2: deb822 — блок с cdrom:/file: в URIs комментируется целиком,
+# иначе apt продолжит проверять его как репозиторий.
+cat > "$TMP/cdrom.sources" <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie
+Components: main contrib
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: cdrom://[Debian GNU/Linux 13.7.0_Trixie - Official amd64 NETINST]/
+Suites: trixie
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: file:///srv/local-repo
+Suites: trixie
+Components: main
+EOF
+
+sanitize_apt_sources "$TMP/cdrom.sources"
+if grep -q '^# URIs: cdrom://' "$TMP/cdrom.sources" && grep -q '^# URIs: file://' "$TMP/cdrom.sources"; then
+    t_ok "deb822: блоки cdrom и file закомментированы"
+else
+    t_bad "deb822: блоки cdrom и file закомментированы" "$(cat "$TMP/cdrom.sources")"
+fi
+# Весь блок, а не только строка URIs: незакомментированные Types:/Suites:
+if ! grep -vE '^[[:space:]]*#' "$TMP/cdrom.sources" | grep -qE 'cdrom|local-repo'; then
+    t_ok "deb822: у закомментированных блоков не осталось активных полей"
+else
+    t_bad "deb822: у закомментированных блоков не осталось активных полей" \
+        "$(grep -vE '^[[:space:]]*#' "$TMP/cdrom.sources")"
+fi
+if grep -q '^URIs: http://deb.debian.org/debian$' "$TMP/cdrom.sources"; then
+    t_ok "deb822: рабочий блок не тронут"
+else
+    t_bad "deb822: рабочий блок не тронут" "$(cat "$TMP/cdrom.sources")"
+fi
+
+# Формат 3: бэкап и идемпотентность
+if [[ -f "$TMP/cdrom.list.gamedock.bak" ]] && grep -q '^deb cdrom:/' "$TMP/cdrom.list.gamedock.bak"; then
+    t_ok "исходное содержимое сохранено в .gamedock.bak"
+else
+    t_bad "исходное содержимое сохранено в .gamedock.bak" "бэкапа нет"
+fi
+before="$(cat "$TMP/cdrom.list.gamedock.bak")"
+sanitize_apt_sources "$TMP/cdrom.list"
+if [[ $before == "$(cat "$TMP/cdrom.list.gamedock.bak")" ]] && [[ $before != "$(cat "$TMP/cdrom.list")" ]]; then
+    t_ok "повторный вызов ничего не ломает"
+else
+    t_bad "повторный вызов ничего не ломает" "бэкап перезаписан или файл изменился"
+fi
+
+# Формат 4: файла с cdrom нет — функция не должна ничего трогать
+cat > "$TMP/clean.list" <<'EOF'
+deb http://deb.debian.org/debian trixie main
+EOF
+
+before="$(cat "$TMP/clean.list")"
+sanitize_apt_sources "$TMP/clean.list"
+if [[ $before == "$(cat "$TMP/clean.list")" ]] && [[ ! -f "$TMP/clean.list.gamedock.bak" ]]; then
+    t_ok "чистый файл не меняется и не получает бэкап"
+else
+    t_bad "чистый файл не меняется и не получает бэкап" "файл изменён: $(cat "$TMP/clean.list")"
+fi
+
 # ── Имена PHP-пакетов ─────────────────────────────────────────────────
 #
 # Пакеты PHP называются с точкой: php8.3-fpm. Раньше в списке apt-пакетов стояло
@@ -383,6 +486,13 @@ for f in install.sh agent.sh; do
         t_ok "$f: pkg_available есть"
     else
         t_bad "$f: pkg_available есть"
+    fi
+    # Отключение cdrom:-репозиториев нужно обоим: нода с netinst-образа
+    # упала бы на apt update точно так же, как панель.
+    if grep -q '^sanitize_apt_sources()' "$ROOT/deploy/$f"; then
+        t_ok "$f: sanitize_apt_sources есть"
+    else
+        t_bad "$f: sanitize_apt_sources есть"
     fi
 done
 

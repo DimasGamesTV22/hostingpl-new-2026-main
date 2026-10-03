@@ -604,6 +604,10 @@ ensure_base_tools() {
 
     export DEBIAN_FRONTEND=noninteractive
 
+    # На netinst-образе в sources.list остаётся строка cdrom: — без неё
+    # обновление индексов падает, хотя сеть и репозитории в порядке.
+    sanitize_apt_sources
+
     if ! apt-get update -qq; then
         warn "apt-get update не отработал — пробую поставить без обновления индексов"
     fi
@@ -765,10 +769,99 @@ detect_repo() {
 # Установка пакетов
 # ═══════════════════════════════════════════════════════════════════
 
+# Отключает недоступные локальные репозитории (cdrom:, file:).
+#
+# После установки с netinst-образа в /etc/apt/sources.list остаётся строка
+# вида `deb cdrom:/[Debian GNU/Linux 13.x _Trixie …] trixie main`. Сам ISO
+# к серверу не подключён, поэтому `apt-get update` падает с
+# «Репозиторий … не содержит файла Release» и возвращает код 100. Раньше
+# установщик на этом шаге просто умирал — а сеть и все остальные
+# репозитории при этом были в порядке.
+#
+# Строки комментируем, а не удаляем: исходное состояние остаётся в файле,
+# перед правкой кладём копию в <файл>.gamedock.bak. Поддержаны оба формата
+# apt — классический (deb822-блок не трогаем) и deb822 (комментируем весь
+# блок с cdrom:/file: в URIs, иначе он продолжит проверяться).
+#
+# Без аргументов обрабатываются системные sources-файлы. Свои файлы можно
+# передать явно — этим пользуются тесты в panel/tools/test-install-logic.sh.
+sanitize_apt_sources() {
+    local file tmp patched=0
+    local -a files
+
+    if (( $# > 0 )); then
+        files=("$@")
+    else
+        files=(/etc/apt/sources.list
+               /etc/apt/sources.list.d/*.list
+               /etc/apt/sources.list.d/*.sources)
+    fi
+
+    for file in "${files[@]}"; do
+        [[ -f $file ]] || continue
+        grep -qiE '^[[:space:]]*(deb(-src)?[[:space:]]+|uris:[[:space:]]*)(cdrom|file):' "$file" || continue
+
+        tmp="$(mktemp)"
+
+        if grep -qE '^[[:space:]]*(Types|URIs|Suites|Components):' "$file"; then
+            # deb822: блок — это непрерывная группа непустых строк.
+            awk '
+                function flush(   i) {
+                    for (i = 1; i <= n; i++) {
+                        if (bad && line[i] != "") printf "# %s\n", line[i]
+                        else                             printf "%s\n",  line[i]
+                    }
+                    n = 0; bad = 0
+                }
+                {
+                    line[++n] = $0
+                    if (tolower($0) ~ /^[[:space:]]*uris:[[:space:]]*(cdrom|file):/) bad = 1
+                    if ($0 ~ /^[[:space:]]*$/) flush()
+                }
+                END { flush() }
+            ' "$file" >"$tmp" || true
+        else
+            awk '
+                {
+                    if (tolower($0) ~ /^[[:space:]]*deb(-src)?[[:space:]]+(cdrom|file):/) print "# " $0
+                    else print $0
+                }
+            ' "$file" >"$tmp" || true
+        fi
+
+        if cmp -s "$tmp" "$file"; then
+            rm -f "$tmp"
+            continue
+        fi
+
+        [[ -f "${file}.gamedock.bak" ]] || cp -a "$file" "${file}.gamedock.bak"
+        cat "$tmp" >"$file"
+        rm -f "$tmp"
+        log "  отключён недоступный репозиторий cdrom:/file: в $(basename "$file")"
+        patched=1
+    done
+
+    if [[ $patched -eq 1 ]]; then
+        warn "Репозиторий с установочного ISO отключён (резервная копия — *.gamedock.bak)"
+    fi
+
+    return 0
+}
+
 apt_update() {
     log "Обновляю список пакетов…"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    sanitize_apt_sources
+
+    # Код 100 у apt-get update означает «какой-то репозиторий не обновился»,
+    # а не «обновление не удалось»: индексы доступных репозиториев к этому
+    # моменту уже скачаны, и ставить из них можно. Поэтому предупреждаем и
+    # идём дальше — иначе один недоступный сторонний репозиторий обрывал
+    # всю установку.
+    if ! apt-get update -qq; then
+        warn "apt-get update завершился с ошибкой — какие-то репозитории не обновились"
+        warn "Ставлю из уже загруженных индексов; список источников: grep -rhv '^#' /etc/apt/sources.list /etc/apt/sources.list.d/"
+    fi
 }
 
 # Добавляет компонент репозитория (main/contrib/universe/…) в sources-файл.
@@ -832,6 +925,11 @@ enable_apt_components() {
     fi
 
     local file comp changed=0
+
+    # До правки компонентов: иначе apt_add_component допишет их в первую
+    # активную строку deb — а на netinst-образе это строка cdrom: с образа,
+    # который к серверу не подключён.
+    sanitize_apt_sources
 
     for file in /etc/apt/sources.list \
                 /etc/apt/sources.list.d/*.sources \
@@ -1458,7 +1556,21 @@ setup_redis() {
         return
     fi
 
-    REDIS_PASS="$(gen_hex 32)"
+    # Переиспользуем уже настроенный пароль, а не генерируем новый.
+    # При повторной установке новый пароль попадал и в Redis, и в .env,
+    # но уже работавшие процессы панели оставались со старым — в журнале
+    # это видно как «AUTH failed: WRONGPASS» минутами подряд. Перезапуск
+    # установщика не должен ломать работающую панель.
+    if [[ -f /etc/redis/redis.conf.gamedock ]]; then
+        REDIS_PASS="$(awk '/^requirepass[[:space:]]+/ { print $2; exit }' /etc/redis/redis.conf.gamedock)"
+    fi
+
+    if [[ -z ${REDIS_PASS:-} ]]; then
+        REDIS_PASS="$(gen_hex 32)"
+        log "Создан новый пароль Redis"
+    else
+        log "Использую уже настроенный пароль Redis"
+    fi
 
     systemctl enable --now redis-server
 
@@ -2611,6 +2723,12 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=gamedock-scheduler
 NoNewPrivileges=true
+
+# Без этой секции юит остаётся static: systemctl enable ничего не делает,
+# и после перезагрузки планировщик (биллинг, автосъём, оповещения)
+# не поднимается.
+[Install]
+WantedBy=multi-user.target
 EOF
 
     # Агент-шаблон (инстанцируется на каждой ноде)
@@ -2821,16 +2939,72 @@ setup_firewall() {
             warn "Рантайм native: игровые порты 25000-25999 (game), 26000-26999 (query), 27000-27199 (rcon) нужно открыть"
         fi
 
-        # fail2ban
-        if [[ -f /etc/fail2ban/filter.d/sshd.conf ]]; then
-            systemctl enable --now fail2ban
-        fi
-
         ok "Файрвол настроен"
     else
         warn "ufw не найден — настройте файрвол вручную"
     fi
+
+    setup_fail2ban
 }
+# Настройка fail2ban с исключениями.
+#
+# Без ignoreip установщик способен заблокировать доступ к машине: клиент,
+# который повторно подключается во время перезагрузки или высокой нагрузки,
+# даёт sshd записи «Connection closed by authenticating user». При maxretry=5
+# за findtime=10m адрес попадает в бан, и SSH перестаёт отвечать, хотя машина
+# жива и ping идёт. Снаружи это неотличимо от «сервер пропал».
+#
+# Поэтому в исключения всегда входят приватные сети и адрес, с которого
+# пришёл текущий SSH.
+setup_fail2ban() {
+    if [[ ! -f /etc/fail2ban/filter.d/sshd.conf ]]; then
+        log "sshd-фильтр fail2ban не найден — пропускаю"
+        return 0
+    fi
+
+    local ignore="127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+
+    # Адрес, с которого пришла установка: его точно нельзя банить.
+    local caller
+    caller="$(who am i 2>/dev/null | awk '{print $NF}')"
+    if [[ $caller =~ ^[0-9a-fA-F:.]+$ ]]; then
+        ignore="$ignore $caller"
+    fi
+
+    # Админы, которых не должно банить, берём из списка в /root/.gamedock-ssh-allowed
+    local allowed="/root/.gamedock-ssh-allowed"
+    if [[ -f $allowed ]]; then
+        local addr
+        while read -r addr; do
+            [[ -n $addr && $addr != \#* ]] || continue
+            ignore="$ignore $addr"
+        done < "$allowed"
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d
+    cat >/etc/fail2ban/jail.d/gamedock.local <<JAIL
+[DEFAULT]
+# Свои адреса банить нельзя: потеря доступа к машине.
+ignoreip = ${ignore}
+
+[sshd]
+enabled = true
+maxretry = 5
+findtime = 10m
+bantime = 1h
+JAIL
+
+    # Перезапуск нужен, чтобы ignoreip применился.
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    if systemctl restart fail2ban >/dev/null 2>&1; then
+        ok "fail2ban настроен, исключения: ${ignore}"
+    else
+        warn "Не удалось перезапустить fail2ban — проверьте: journalctl -u fail2ban -n 20"
+    fi
+
+    log "Свои адреса можно добавить в $allowed (по одному в строке)"
+}
+
 
 optimize_system() {
     step "Оптимизация системы"
@@ -2864,9 +3038,16 @@ vm.vfs_cache_pressure = 50
 vm.max_map_count = 262144
 
 # Базовая безопасность
+# rp_filter=2 (мягкий), а не 1 (строгий).
+#
+# Строгий режим отбрасывает пакет, если маршрут к источнику не ведёт через
+# тот же интерфейс. У виртуалки за NAT маршрутизация несимметричная, и
+# строгий режим рвёт сеть целиком: машина жива, но не отвечает ни на ping,
+# ни на SSH. Наблюдалось дважды во время установки. Мягкий режим проверяет
+# только достижимость источника и для NAT безопасен.
 kernel.dmesg_restrict = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
 SYSCTL
 
     if command -v bbr >/dev/null 2>&1 || modprobe tcp_bbr 2>/dev/null; then
@@ -2875,7 +3056,14 @@ SYSCTL
         warn "BBR не поддерживается ядром — будет CUBIC"
     fi
 
-    sysctl --system >/dev/null 2>&1 || warn "sysctl не применился"
+    # Применяем только свой файл. sysctl --system прогоняет все настройки из
+    # /etc/sysctl.d и /etc/sysctl.conf, и побочные эффекты от чужих значений
+    # потом невозможно отделить от наших.
+    if sysctl -p /etc/sysctl.d/99-gamedock.conf >/dev/null 2>&1; then
+        ok "Параметры ядра применены"
+    else
+        warn "Не все параметры ядра применились — проверьте: sysctl -p /etc/sysctl.d/99-gamedock.conf"
+    fi
 
     # Ограничение для systemd-сервисов GameDock
     mkdir -p /etc/systemd/system/gamedock-wss.service.d
@@ -3425,28 +3613,95 @@ script_source() {
     return 1
 }
 
+# Показывает хвост журнала установки.
+#
+# Нужен после падения дочернего процесса: сам он умирает на середине,
+# и без журнала на экране остаётся только «✗» — с чем именно не
+# получилось, выяснять приходится вручную.
+show_install_log_tail() {
+    local n="${1:-15}"
+
+    [[ -s $LOG_FILE ]] || return 0
+
+    printf '\n'
+    info "Последние строки $LOG_FILE:"
+    tail -n "$n" "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
+}
+
+# Обёртка над дочерним установщиком: показывает причину падения.
+#
+# Раньше код возврата просто уходил в set -e, и наблюдатель видел одно и
+# то же: листающийся текст, возврат в меню, попытка снова. Похоже на «устал
+# и перезапустил», хотя на самом деле установка упала на конкретной строке.
+# Теперь падение подтверждается кодом, показывается хвост журнала, и только
+# после Enter пользователь возвращается в меню.
+child_failed() {
+    local rc="$1" what="$2"
+
+    echo
+    err "$what прервалась (код выхода $rc)"
+    show_install_log_tail 15
+    echo
+    info "Установка не закончена. Что было сделано — осталось на месте:"
+    info "повторный запуск продолжит с того места, где остановились."
+    info "Подробности: less $LOG_FILE"
+    pause
+
+    return 0
+}
+
 # Запускает install.sh с переданными аргументами
 run_install() {
-    local script
+    local script rc
     if ! script="$(script_source install.sh)"; then
         err "Не найден install.sh: ни рядом с menu.sh, ни в $INSTALL_DIR/deploy"
-        return 1
+        pause
+        return 0
     fi
 
     chmod +x "$script" 2>/dev/null || true
-    bash "$script" "$@"
+    # GAMEDOCK_NESTED=1 — дочерний процесс запущен из пункта меню. Без этой
+    # метки он увидит «нет аргументов + терминал» и откроет меню заново
+    # вместо установки, попутно перехватывая ввод.
+    #
+    # `set +e` на время запуска обязателен: дочерний процесс — это внешняя
+    # команда, и при возврате ненулевого кода `set -e` завершил бы и сам
+    # install.sh, то есть меню. Именно этим объяснялось «начал ставить —
+    # сразу опять меню»: падение не отличалось от отмены.
+    set +e
+    GAMEDOCK_NESTED=1 bash "$script" "$@"
+    rc=$?
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+        child_failed "$rc" "Установка"
+    fi
+
+    return 0
 }
 
 # Запускает agent.sh
 run_agent() {
-    local script
+    local script rc
     if ! script="$(script_source agent.sh)"; then
         err "Не найден agent.sh: ни рядом с menu.sh, ни в $INSTALL_DIR/deploy"
-        return 1
+        pause
+        return 0
     fi
 
     chmod +x "$script" 2>/dev/null || true
+    # Как и в run_install: без `set +e` ненулевой код дочернего процесса
+    # убивал бы сам install.sh вместе с меню.
+    set +e
     bash "$script" "$@"
+    rc=$?
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+        child_failed "$rc" "Установка агента"
+    fi
+
+    return 0
 }
 
 # ── Пункт 1. Веб-сервер (LAMP) ────────────────────────────────────────
@@ -3507,6 +3762,10 @@ install_panel() {
     fi
 
     info "Потребуется домен панели и почта администратора"
+    info "Запускаю линейную установку панели. Меню вернётся после неё."
+
+    # Флаги не передаём: панель должна спросить домен и почту.
+    # От меню нас отделяет GAMEDOCK_NESTED внутри run_install.
     run_install "$@"
 }
 
@@ -4298,14 +4557,46 @@ check_url() {
 #
 # Прежний отдельный файл deploy/menu.sh удалён: его подменui живут здесь.
 # ═══════════════════════════════════════════════════════════════════
+# Выбор режима запуска
+# ═══════════════════════════════════════════════════════════════════
+
+# Показывать ли меню.
+#
+# Меню показывается:
+#   1. по явному ключу --menu;
+#   2. при запуске без аргументов в терминале.
+#
+# И НЕ показывается, если процесс запущен из пункта меню сам же
+# (GAMEDOCK_NESTED=1). Раньше это различалось только по числу аргументов:
+# install_panel вызывал run_install без флагов, дочерний install.sh
+# стартовал с нулём аргументов и открывал меню заново вместо установки,
+# попутно наследуя stdin и забирая нажатия. Терминал у вложенного
+# запуска тот же, что у родителя, поэтому по нему их не различить —
+# нужен явный признак.
+mode_is_menu() {
+    if [[ -n ${SHOW_MENU:-} ]]; then
+        return 0
+    fi
+
+    if [[ -n ${GAMEDOCK_NESTED:-} ]]; then
+        return 1
+    fi
+
+    [[ $# -eq 0 ]]
+}
+
+# ═══════════════════════════════════════════════════════════════════
 
 # Выполняем нижний код только когда файл запущен как скрипт. Иначе
 # `source install.sh` (так делают тесты, вызывая отдельные функции)
 # приводил бы к запуску установки.
+# Нижний код выполняется только когда файл запущен как скрипт. Иначе
+# `source install.sh` (так делают тесты, вызывая отдельные функции)
+# приводил бы к запуску установки.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-if [[ -n $SHOW_MENU ]] || { [[ $# -eq 0 ]] && [[ -t 0 ]] && [[ -t 1 ]]; }; then
-    run_menu "$@"
-else
-    main "$@"
-fi
+    if mode_is_menu "$@"; then
+        run_menu "$@"
+    else
+        main "$@"
+    fi
 fi

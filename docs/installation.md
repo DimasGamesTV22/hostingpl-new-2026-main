@@ -66,9 +66,10 @@ v2 через параметр ядра (потребуется перезагр
 
 ```bash
 node panel/tools/check-distros.cjs      # матрица согласована с документацией
-bash panel/tools/test-install-logic.sh  # 70 проверок: detect_distro, apt, PHP-пакеты
-bash panel/tools/test-menu.sh           # 33 проверки: меню, подменю, гейт на веб-сервер
-bash panel/tools/test-system-checks.sh  # 23 проверки: диск, лог-файл, чистая машина
+bash panel/tools/test-install-logic.sh  # detect_distro, apt, PHP-пакеты
+bash panel/tools/test-menu.sh           # меню, подменю, гейт, падение установщика
+bash panel/tools/check-mode.sh          # выбор режима запуска
+bash panel/tools/test-system-checks.sh  # порядок шагов, ключи, systemd, сеть
 ```
 
 Полные требования — в [requirements.md](requirements.md).
@@ -87,12 +88,25 @@ dig +short panel.example.com
 # Должен вывести IP вашего сервера
 ```
 
+> **Ошибка `Репозиторий «cdrom:///…» не содержит файла Release`** — машина
+> поставлена с установочного ISO, и в `/etc/apt/sources.list` осталась строка
+> `deb cdrom:/[Debian GNU/Linux …] trixie main`. Сам образ к серверу не
+> подключён, поэтому `apt update` на ней всегда будет падать. Установщик
+> GameDock такие строки сам комментирует (копия остаётся рядом в
+> `<файл>.gamedock.bak`). Вручную — одной командой:
+>
+> ```bash
+> sed -i -E 's|^[[:space:]]*(deb(-src)?[[:space:]]+(cdrom|file):)|# \1|' \
+>     /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null
+> apt update
+> ```
+
 ### Шаг 2. Запуск
 
 **Вариант 1 — меню** (рекомендуется). Одно окно со всеми операциями:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/menu.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/install.sh | sudo bash
 ```
 
 ```
@@ -126,7 +140,15 @@ curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-m
 **Вариант 2 — без меню**, одной командой и без вопросов:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/DimasGamesTV22/hostingpl-new-2026-main/main/deploy/install.sh \
+  | sudo bash -s -- \
+      --domain panel.example.com \
+      --email admin@example.com \
+      --name GameDock \
+      --node-mode auto \
+      --runtime docker \
+      --with-agent \
+      --yes
 ```
 
 Либо скачайте и запустите с параметрами:

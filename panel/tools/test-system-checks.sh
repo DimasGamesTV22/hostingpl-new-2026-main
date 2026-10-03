@@ -1795,6 +1795,328 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 30. Автоустановщик — один файл
+#
+# Раньше меню жило в отдельном deploy/menu.sh. Два файла — два источника
+# правды: подменю, вызывающие install.sh, и сам install.sh расходились.
+# Теперь меню внутри install.sh, а отдельного файла нет.
+# ═══════════════════════════════════════════════════════════════════
+head_ "Единый файл установщика"
+
+if [[ ! -e "$ROOT/deploy/menu.sh" ]]; then
+    t_ok "отдельного deploy/menu.sh нет"
+else
+    t_bad "отдельного deploy/menu.sh нет" "меню живёт в install.sh, второй файл лишний"
+fi
+
+# Функции меню обязаны быть в install.sh
+menu_fns="main_menu run_menu banner menu_item menu_footer read_choice confirm pause"
+menu_fns="$menu_fns menu_cron_backup menu_services menu_status install_all ensure_repo"
+missing_menu=""
+for fn in $menu_fns; do
+    if ! grep -q "^${fn}()" "$INSTALL_SH"; then
+        missing_menu="$missing_menu $fn"
+    fi
+done
+if [[ -z $missing_menu ]]; then
+    t_ok "функции меню объявлены в install.sh"
+else
+    t_bad "функции меню в install.sh" "нет:$missing_menu"
+fi
+
+# Помощники вывода не должны дублироваться: у install.sh свои ok, warn,
+# step, ask — они ещё и пишут в LOG_FILE. Дубли перекрыли бы их молча.
+for fn in ok warn step ask; do
+    n=$(grep -c "^${fn}()" "$INSTALL_SH" || true)
+    if [[ $n -eq 1 ]]; then
+        t_ok "$fn определён один раз"
+    else
+        t_bad "$fn определён один раз" "определений: $n"
+    fi
+done
+
+# Меню — режим по умолчанию, но линейный сценарий обязан сохраниться:
+# он нужен для CI и Docker, где параметры передаются всегда.
+# -qF, а не -q: в базовом регулярном выражении «|» литерален, и шаблон
+#   '-menu|-m)' просто не находился бы.
+if grep -qF -- '--menu|-m)' "$INSTALL_SH" && grep -qF 'SHOW_MENU="yes"' "$INSTALL_SH"; then
+    t_ok "есть ключ --menu"
+else
+    t_bad "есть ключ --menu" "меню нельзя выбрать явно"
+fi
+
+if grep -q 'main "\$@"' "$INSTALL_SH"; then
+    t_ok "линейный сценарий сохранён"
+else
+    t_bad "линейный сценарий сохранён" "нет вызова main"
+fi
+
+# Нижний код под защитой: без неё `source install.sh` запускал бы
+# установку — а так подгружают эти же тесты.
+if grep -qF 'BASH_SOURCE[0]}" == "${0}' "$INSTALL_SH"; then
+    t_ok "нижний код защищён от source"
+else
+    t_bad "нижний код защищён от source" "нет проверки BASH_SOURCE"
+fi
+
+# Меню не должно тянуть отсутствующий файл.
+# Комментарии не в счёт: в install.sh осталось упоминание «перенесено из
+# прежнего deploy/menu.sh» как объяснение. Смотрим только исполняемые строки.
+menu_code=$(grep -v '^[[:space:]]*#' "$INSTALL_SH" | grep -F '/deploy/menu.sh' || true)
+if [[ -z $menu_code ]]; then
+    t_ok "установщик не ссылается на menu.sh"
+else
+    t_bad "установщик не ссылается на menu.sh" "остались ссылки на удалённый файл"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 31. Юниты в автозагрузке и идемпотентность Redis
+# ═══════════════════════════════════════════════════════════════════
+head_ "Юниты и Redis"
+
+# Каждый генерируемый юнит обязан иметь [Install]. Без него systemd
+# считает юнит static: enable молча ничего не делает, и после перезагрузки
+# служба не поднимается.
+for unit in gamedock-wss gamedock-scheduler; do
+    body=$(sed -n "/cat >\/etc\/systemd\/system\/${unit}\.service/,/^EOF$/p" "$INSTALL_SH")
+    if [[ -z $body ]]; then
+        t_bad "юнит $unit описан" "блок юнита не найден"
+    elif grep -q '^\[Install\]$' <<<"$body" && grep -q 'WantedBy=multi-user.target' <<<"$body"; then
+        t_ok "юнит $unit включается в автозагрузку"
+    else
+        t_bad "юнит $unit включается в автозагрузку" "нет [Install] — будет static"
+    fi
+done
+
+# Шаблон очереди — отдельная проверка: он общий для всех инстансов
+qbody=$(sed -n '/cat >\/etc\/systemd\/system\/gamedock-queue@\.service/,/^EOF$/p' "$INSTALL_SH")
+if grep -q '^\[Install\]$' <<<"$qbody"; then
+    t_ok "шаблон очереди включается в автозагрузку"
+else
+    t_bad "шаблон очереди включается в автозагрузку" "нет [Install]"
+fi
+
+# Пароль Redis не должен меняться при повторной установке
+RED_BODY=$(sed -n '/^setup_redis()/,/^}/p' "$INSTALL_SH")
+if grep -q 'redis.conf.gamedock' <<<"$RED_BODY" && grep -q 'awk .*requirepass' <<<"$RED_BODY"; then
+    t_ok "пароль Redis переиспользуется"
+else
+    t_bad "пароль Redis переиспользуется" "пароль генерируется заново каждый раз"
+fi
+
+# Генерация должна быть лишь запасным путём, когда пароля ещё нет
+gen_count=$(grep -c 'REDIS_PASS="\$(gen_hex 32)"' <<<"$RED_BODY" || true)
+if [[ $gen_count -eq 1 ]] && grep -q '^ *if \[\[ -z \${REDIS_PASS:-} \]\]; then$' <<<"$RED_BODY"; then
+    t_ok "новый пароль создаётся только при отсутствии"
+else
+    t_bad "новый пароль создаётся только при отсутствии" "генераций: $gen_count"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# 32. Параметры ядра: rp_filter и область применения sysctl
+#
+# Строгий rp_filter=1 ронял сеть на виртуалке за NAT (наблюдалось дважды
+# во время установки: ни ping, ни SSH). Нужен мягкий режим 2.
+# ═══════════════════════════════════════════════════════════════════
+head_ "Параметры ядра"
+
+OPT_BODY=$(sed -n '/^optimize_system()/,/^}/p' "$INSTALL_SH")
+
+# rp_filter проверяем по строке значения, а не по упоминанию в комментарии.
+if grep -qE '^[[:space:]]*net\.ipv4\.conf\.(all|default)\.rp_filter = 1$' <<<"$OPT_BODY"; then
+    t_bad "rp_filter не строгий" "включён режим 1 — сеть рвётся за NAT"
+else
+    t_ok "rp_filter не строгий"
+fi
+
+all_mode=$(grep -E 'net\.ipv4\.conf\.all\.rp_filter = ' <<<"$OPT_BODY" | head -1 | tr -d ' ' | cut -d= -f2)
+def_mode=$(grep -E 'net\.ipv4\.conf\.default\.rp_filter = ' <<<"$OPT_BODY" | head -1 | tr -d ' ' | cut -d= -f2)
+if [[ $all_mode == 2 && $def_mode == 2 ]]; then
+    t_ok "rp_filter=2 для all и default"
+else
+    t_bad "rp_filter=2 для all и default" "all=$all_mode, default=$def_mode"
+fi
+
+# Применяться должен только наш файл, а не весь /etc/sysctl.d.
+if grep -qE '^[[:space:]]*sysctl --system' <<<"$OPT_BODY"; then
+    t_bad "применяется только свой файл sysctl" "sysctl --system тянет чужие настройки"
+else
+    t_ok "применяется только свой файл sysctl"
+fi
+
+if grep -qF 'sysctl -p /etc/sysctl.d/99-gamedock.conf' <<<"$OPT_BODY"; then
+    t_ok "sysctl -p по своему файлу"
+else
+    t_bad "sysctl -p по своему файлу" "параметры не применяются явно"
+fi
+
+# Имя файла в sysctl -p должно совпадать с именем, куда пишем.
+written=$(grep -oE '/etc/sysctl\.d/[a-z0-9.-]+\.conf' <<<"$OPT_BODY" | head -1)
+applied=$(grep -oE 'sysctl -p /etc/sysctl\.d/[a-z0-9.-]+\.conf' <<<"$OPT_BODY" | head -1 | awk '{print $3}')
+if [[ -n $written && $written == "$applied" ]]; then
+    t_ok "применяется тот же файл, что и записывается"
+else
+    t_bad "файлы sysctl совпадают" "записывается $written, применяется $applied"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# 33. fail2ban не должен запирать администратора
+# ═══════════════════════════════════════════════════════════════════
+head_ "fail2ban и доступ"
+
+FW_BODY=$(sed -n '/^setup_fail2ban()/,/^}/p' "$INSTALL_SH")
+
+if [[ -n $FW_BODY ]]; then
+    t_ok "настройка fail2ban вынесена в отдельную функцию"
+else
+    t_bad "настройка fail2ban вынесена в отдельную функцию" "нет setup_fail2ban()"
+fi
+
+# ignoreip обязателен: без него бан своего адреса = потеря доступа.
+if grep -q '^ignoreip = ' <<<"$FW_BODY"; then
+    t_ok "задан ignoreip"
+else
+    t_bad "задан ignoreip" "без него можно забанить себя"
+fi
+
+# Приватные сети в исключениях: у панели часто private-адрес.
+for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    if grep -qF "$net" <<<"$FW_BODY"; then
+        t_ok "приватная сеть $net в исключениях"
+    else
+        t_bad "приватная сеть $net в исключениях" "нет в ignoreip"
+    fi
+done
+
+# Адрес текущего SSH добавляется: установку могут запускать из разных мест.
+if grep -qE 'who am i|SSH_CLIENT|SSH_CONNECTION' <<<"$FW_BODY"; then
+    t_ok "адрес текущего SSH добавляется в исключения"
+else
+    t_bad "адрес текущего SSH в исключениях" "установка из нового места может получить бан"
+fi
+
+# Возможность дописать свои адреса: у администратора должны быть все.
+if grep -qF '.gamedock-ssh-allowed' <<<"$FW_BODY"; then
+    t_ok "есть файл для своих адресов"
+else
+    t_bad "есть файл для своих адресов" "нет способа добавить администратора"
+fi
+
+# Конфиг пишется в jail.d: jail.local перезаписывать нельзя.
+if grep -qF 'jail.d/gamedock.local' <<<"$FW_BODY"; then
+    t_ok "конфиг пишется в свой файл jail.d"
+else
+    t_bad "конфиг пишется в свой файл jail.d" "перезапись jail.local затрёт настройки"
+fi
+
+# После изменения ignoreip сервис обязательно перезапускается, иначе
+# настройка просто не применится.
+if grep -q 'systemctl restart fail2ban' <<<"$FW_BODY"; then
+    t_ok "fail2ban перезапускается после настройки"
+else
+    t_bad "fail2ban перезапускается" "ignoreip не применится"
+fi
+
+# setup_fail2ban обязана вызываться из setup_firewall.
+FIREWALL_BODY=$(sed -n '/^setup_firewall()/,/^}/p' "$INSTALL_SH")
+if grep -q '^[[:space:]]*setup_fail2ban$' <<<"$FIREWALL_BODY"; then
+    t_ok "настройка fail2ban вызывается"
+else
+    t_bad "настройка fail2ban вызывается" "функция объявлена, но не вызывается"
+fi
+
+if grep -q 'systemctl enable --now fail2ban' "$INSTALL_SH"; then
+    t_bad "fail2ban настраивается через setup_fail2ban" "остался прямой вызов systemctl"
+else
+    t_ok "fail2ban настраивается через setup_fail2ban"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# 34. Пункт меню запускает установку, а не новое меню
+# ═══════════════════════════════════════════════════════════════════
+head_ "Вложенный запуск из меню"
+
+# run_install обязан помечать дочерний процесс.
+RI_BODY=$(sed -n '/^run_install()/,/^}/p' "$INSTALL_SH")
+if grep -qF 'GAMEDOCK_NESTED=1 bash "$script" "$@"' <<<"$RI_BODY"; then
+    t_ok "run_install помечает вложенный запуск"
+else
+    t_bad "run_install помечает вложенный запуск" "дочерний процесс не отличить от обычного"
+fi
+
+# Признак вложенного запуска обязан учитываться при выборе режима.
+if grep -qF '${GAMEDOCK_NESTED:-}' "$INSTALL_SH"; then
+    t_ok "при выборе режима учитывается вложенный запуск"
+else
+    t_bad "при выборе режима учитывается вложенный запуск" "вложенный процесс откроет меню"
+fi
+
+# Прежний составной признак «нет аргументов И терминал» в хвосте файла
+# больше не используется: условие целиком живёт в mode_is_menu.
+# у вложенного запуска терминал тот же, что у родителя.
+if grep -qF '{ [[ $# -eq 0 ]] && [[ -t 0 ]] && [[ -t 1 ]]; }' "$INSTALL_SH"; then
+    t_bad "нет признака меню по числу аргументов" "вложенный запуск без флагов попадёт в меню"
+else
+    t_ok "нет признака меню по числу аргументов"
+fi
+
+# Решение о режиме вынесено в mode_is_menu — так его можно проверить
+# без псевдотерминала, что и делает panel/tools/check-mode.sh.
+MODE_BODY=$(sed -n '/^mode_is_menu()/,/^}/p' "$INSTALL_SH")
+if [[ -n $MODE_BODY ]]; then
+    t_ok "выбор режима вынесен в mode_is_menu"
+else
+    t_bad "выбор режима вынесен в mode_is_menu" "нет функции"
+fi
+
+# Внутри — три исхода: явное меню, отказ при вложенном запуске,
+# вход без аргументов.
+for needle in 'if [[ -n ${SHOW_MENU:-} ]]; then' 'if [[ -n ${GAMEDOCK_NESTED:-} ]]; then' '[[ $# -eq 0 ]]'; do
+    if grep -qF "$needle" <<<"$MODE_BODY"; then
+        t_ok "mode_is_menu содержит: $needle"
+    else
+        t_bad "mode_is_menu содержит: $needle" "нет такого условия"
+    fi
+done
+
+# Вложенный запуск обязан отказывать ДО проверки аргументов, иначе
+# возврат будет неявным и легко потеряется при правках.
+nested_line=$(grep -n 'GAMEDOCK_NESTED' <<<"$MODE_BODY" | head -1 | cut -d: -f1)
+args_line=$(grep -n '\[\[ \$# -eq 0 \]\]' <<<"$MODE_BODY" | head -1 | cut -d: -f1)
+if [[ -n $nested_line && -n $args_line ]] && (( nested_line < args_line )); then
+    t_ok "вложенный запуск проверяется раньше числа аргументов"
+else
+    t_bad "вложенный запуск проверяется раньше" "вложенный $nested_line, аргументы $args_line"
+fi
+
+# В хвосте файла остаётся только вызов mode_is_menu.
+if grep -qF 'if mode_is_menu "$@"; then' "$INSTALL_SH"; then
+    t_ok "хвост файла использует mode_is_menu"
+else
+    t_bad "хвост файла использует mode_is_menu" "условие продублировано в хвосте"
+fi
+
+
+# Пункт «Установка панели» обязан честно сказать, что идёт установка.
+IP_BODY=$(sed -n '/^install_panel()/,/^}/p' "$INSTALL_SH")
+if grep -q 'Запускаю линейную установку' <<<"$IP_BODY"; then
+    t_ok "пункт 2 сообщает, что идёт установка"
+else
+    t_bad "пункт 2 сообщает, что идёт установка" "пользователь видит скачок без объяснения"
+fi
+
+# Флаги --yes передавать нельзя: панель должна спросить домен и почту.
+if grep -q 'run_install --yes' <<<"$IP_BODY"; then
+    t_bad "пункт 2 не отключает диалог" "--yes не даст спросить домен и почту"
+else
+    t_ok "пункт 2 не отключает диалог"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 printf '\nПройдено: %d, провалено: %d\n' "$pass" "$fail"
 [[ $fail -eq 0 ]] || exit 1
 

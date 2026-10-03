@@ -350,6 +350,84 @@ check_system() {
 # Пакеты
 # ═══════════════════════════════════════════════════════════════════
 
+# Отключает недоступные локальные репозитории (cdrom:, file:).
+#
+# После установки с netinst-образа в /etc/apt/sources.list остаётся строка
+# вида `deb cdrom:/[Debian GNU/Linux 13.x _Trixie …] trixie main`. Сам ISO
+# к ноде не подключён, поэтому `apt-get update` падает с «Репозиторий …
+# не содержит файла Release» и возвращает код 100, обрывая установку,
+# хотя сеть и остальные репозитории в порядке.
+#
+# Строки комментируем, а не удаляем: исходное состояние остаётся в файле,
+# перед правкой копия уходит в <файл>.gamedock.bak. Поддержаны оба формата
+# apt — классический и deb822 (там комментируется весь блок с cdrom:/file:
+# в URIs).
+#
+# Без аргументов обрабатываются системные sources-файлы. Свои файлы можно
+# передать явно — этим пользуются тесты в panel/tools/test-install-logic.sh.
+sanitize_apt_sources() {
+    local file tmp patched=0
+    local -a files
+
+    if (( $# > 0 )); then
+        files=("$@")
+    else
+        files=(/etc/apt/sources.list
+               /etc/apt/sources.list.d/*.list
+               /etc/apt/sources.list.d/*.sources)
+    fi
+
+    for file in "${files[@]}"; do
+        [[ -f $file ]] || continue
+        grep -qiE '^[[:space:]]*(deb(-src)?[[:space:]]+|uris:[[:space:]]*)(cdrom|file):' "$file" || continue
+
+        tmp="$(mktemp)"
+
+        if grep -qE '^[[:space:]]*(Types|URIs|Suites|Components):' "$file"; then
+            # deb822: блок — непрерывная группа непустых строк.
+            awk '
+                function flush(   i) {
+                    for (i = 1; i <= n; i++) {
+                        if (bad && line[i] != "") printf "# %s\n", line[i]
+                        else                             printf "%s\n",  line[i]
+                    }
+                    n = 0; bad = 0
+                }
+                {
+                    line[++n] = $0
+                    if (tolower($0) ~ /^[[:space:]]*uris:[[:space:]]*(cdrom|file):/) bad = 1
+                    if ($0 ~ /^[[:space:]]*$/) flush()
+                }
+                END { flush() }
+            ' "$file" >"$tmp" || true
+        else
+            awk '
+                {
+                    if (tolower($0) ~ /^[[:space:]]*deb(-src)?[[:space:]]+(cdrom|file):/) print "# " $0
+                    else print $0
+                }
+            ' "$file" >"$tmp" || true
+        fi
+
+        if cmp -s "$tmp" "$file"; then
+            rm -f "$tmp"
+            continue
+        fi
+
+        [[ -f "${file}.gamedock.bak" ]] || cp -a "$file" "${file}.gamedock.bak"
+        cat "$tmp" >"$file"
+        rm -f "$tmp"
+        log "  отключён недоступный репозиторий cdrom:/file: в $(basename "$file")"
+        patched=1
+    done
+
+    if [[ $patched -eq 1 ]]; then
+        warn "Репозиторий с установочного ISO отключён (резервная копия — *.gamedock.bak)"
+    fi
+
+    return 0
+}
+
 # Добавляет компонент репозитория (main/contrib/universe/…) в sources-файл.
 # Возвращает 0, если файл изменён, 1 — если компонент уже был.
 #
@@ -399,6 +477,8 @@ enable_apt_components() {
         want=(main contrib non-free non-free-firmware)
     fi
 
+    sanitize_apt_sources
+
     if command -v add-apt-repository >/dev/null 2>&1; then
         for comp in "${want[@]}"; do
             add-apt-repository -y "$comp" >/dev/null 2>&1 || true
@@ -415,7 +495,9 @@ enable_apt_components() {
         done
     fi
 
-    apt-get update -qq
+    # Код 100 означает «часть репозиториев не обновилась», а не «обновление
+    # не удалось» — индексы рабочих репозиториев к этому моменту уже есть.
+    apt-get update -qq || warn "Часть репозиториев не обновилась — продолжаю с имеющимися индексами"
 }
 
 pkg_available() {
@@ -497,7 +579,7 @@ setup_nodejs_repo() {
 deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main
 NODESOURCEEOF
 
-    apt-get update -qq
+    apt-get update -qq || warn "Репозиторий NodeSource не обновился — возможно, нет доступа в интернет"
 }
 
 install_dependencies() {
@@ -659,7 +741,7 @@ install_docker() {
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} ${OS_CODENAME} stable" \
             >/etc/apt/sources.list.d/docker.list
 
-        apt-get update -qq
+        apt-get update -qq || warn "Репозиторий Docker не обновился — ставлю из имеющихся индексов"
         if ! apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin </dev/null 2>&1 | tail -3; then
             fail "Не удалось поставить Docker из download.docker.com/linux/${OS_ID}"
         fi

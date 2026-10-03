@@ -9,8 +9,9 @@ import path from 'node:path';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
-import { query as gameQuery } from '../query/index.js';
-import { PathGuard, directorySize, ensureDir } from '../utils/fsx.js';
+import { query as gameQuery } from './query/index.js';
+import { PathGuard, directorySize, ensureDir } from './utils/fsx.js';
+import { buildRuntimeSpec } from './spec.js';
 
 export class ServerManager extends EventEmitter {
     constructor(config, logger, runtimes) {
@@ -49,12 +50,18 @@ export class ServerManager extends EventEmitter {
     /**
      * Регистрация сервера (после server.create от панели).
      */
-    async register(spec) {
-        const serverId = Number(spec.server.id);
+    async register(raw) {
+        const serverId = Number(raw.server.id);
         const dir = this.serverPath(serverId);
 
         await ensureDir(dir, 0o750);
         await ensureDir(this.backupPath(serverId), 0o700);
+
+        // Панель присылает игру, стартовую команду, порты и лимиты внутри
+        // payload.server, а драйверы читают их с верхнего уровня spec.*, и
+        // каталог сервера знаем только мы. Приводим здесь — единственное
+        // место, где путь известен.
+        const spec = buildRuntimeSpec(raw, dir, this.config.nodeId);
 
         const instance = {
             spec,

@@ -19,6 +19,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 
+import { sign as signMessage, verify as verifyMessage } from './signature.js';
+import { decodePayloadEnv } from './spec.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { createRuntimes, probeRuntimes } from './runtimes/index.js';
@@ -234,22 +236,14 @@ class Agent extends EventEmitter {
         }
     }
 
+    // Канонизация и подпись живут в ./signature.js — там же тесты.
+    // Форма обязана совпадать с панелью: AgentConnection::signaturePayload().
     sign(message) {
-        const { sig, ...rest } = message;
-        const payload = Object.keys(rest).sort().map((k) => `${k}=${JSON.stringify(rest[k])}`).join('&');
-
-        return crypto.createHmac('sha256', this.config.token).update(payload).digest('hex');
+        return signMessage(message, this.config.token);
     }
 
     verify(message) {
-        if (!message.sig) return false;
-
-        const { sig, ...rest } = message;
-        const payload = Object.keys(rest).sort().map((k) => `${k}=${JSON.stringify(rest[k])}`).join('&');
-
-        const expected = crypto.createHmac('sha256', this.config.token).update(payload).digest('hex');
-
-        return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig));
+        return verifyMessage(message, this.config.token);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -469,18 +463,11 @@ class Agent extends EventEmitter {
     }
 
     async handleServerCreate(payload) {
+        // Секреты приходят с панели с префиксом enc: — снимаем его здесь,
+        // в единственном месте, где это происходит. Дальше спецификацию
+        // приводит ServerManager.register.
+        decodePayloadEnv(payload);
         const server = payload.server;
-        const spec = payload.spec || {};
-
-        // Панель присылает зашифрованные секреты с префиксом enc:
-        const normalized = {
-            ...spec,
-            server: {
-                ...server,
-                env: decodeEnv(server.env),
-            },
-            node: spec.node || { id: this.config.nodeId },
-        };
 
         // Если сервер уже известен — просто обновляем спецификацию
         if (this.servers.get(server.id)) {
